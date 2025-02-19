@@ -1,0 +1,347 @@
+
+Top functions by exclusive time:
+------------------------------------------------------------
+1. ImageTexture::readPPM                         58,997,599 samples
+2. zap_pte_range                                    512,020 samples
+3. perf_ibs_start                                     3,758 samples
+4. perf_ibs_add                                       1,854 samples
+------------------------------------------------------------
+
+Analyzing hotspot function:
+Function: ImageTexture::readPPM
+Exclusive time: 58,997,599 samples
+
+Extracting dependencies...
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/camera.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/light.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/vector.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/box.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/aabb.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/bvh.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/disk.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/sphere.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/shape.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/triangle.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/plane.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/imagetexture.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/colortexture.h: Error parsing translation unit.
+Error parsing /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h: Error parsing translation unit.
+
+Dependency Analysis Results:
+================================================================================
+Type Definitions:
+------------------------------------------------------------
+Type: ImageTexture::ImageTexture
+Declared at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/imagetexture.h:5:7
+Definition:
+    class ImageTexture: public Texture{
+    /** from 0 to 1 **/
+    public:
+       unsigned int w, h;
+       unsigned char* imageData;
+       void getColor(unsigned char* toFill, double* am, double* op, double* ref, double x, double y);
+       void getColor(unsigned char* toFill, double* am, double *op, double* ref, unsigned int x, unsigned int y);
+       ImageTexture(unsigned char* data, unsigned int ww, unsigned int hh);
+       ImageTexture(unsigned int ww, unsigned int hh);
+       ImageTexture(const char* file);
+       unsigned char* setColor(unsigned int x, unsigned int y, unsigned char* data);
+       unsigned char* setColor(unsigned int x, unsigned int y, unsigned char r, unsigned char g, unsigned char b);
+       void readPPM(FILE* f, const char* file);
+       void maskImage(unsigned char r, unsigned char g, unsigned char b);
+       void maskImage(unsigned char r, unsigned char g, unsigned char b, unsigned char rm, unsigned char gm, unsigned char mb,unsigned char m);
+       void maskImage(unsigned char r, unsigned char g, unsigned char b, unsigned char m);
+          void maskImageU(unsigned char r, unsigned char g, unsigned char b, unsigned char m);
+          void maskImageA(unsigned char r, unsigned char g, unsigned char b, unsigned char m);
+       void maskImage(ColorTexture b);
+       void maskImage(ColorTexture b, unsigned char m);
+       void maskImage(ColorTexture* b);
+       void maskImage(ColorTexture* b, unsigned char m);
+       void maskImageAlpha();
+    };
+------------------------------------------------------------
+
+------------------------------------------------------------
+Function: ImageTexture::readPPM
+Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/imagetexture.h:17:9
+
+Function body:
+       void readPPM(FILE* f, const char* file);
+
+Dependencies:
+  No function calls found.
+  No type references found.
+------------------------------------------------------------
+
+------------------------------------------------------------
+Function: ImageTexture::readPPM
+Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/imagetexture.cpp:171:20
+
+Function body:
+    void ImageTexture::readPPM(FILE* f, const char* file){
+       if (f == NULL){
+          printf("File loading error!!! %s\n", file);
+          exit(0);
+       }
+       int fchar = getc(f);
+       if(fchar!='P'){
+          printf("Header error --1st char not 'P' %s %c %d\n", file, fchar, fchar);
+          exit(0);
+       }
+       int id = getc(f);
+       while(fpeek(f)=='#'){
+          int rr;
+          do{
+             rr = getc(f);
+          } while(rr!='\n');
+       }
+       int x = 0, y = 0;
+       if(id=='6'){
+          int r = fscanf(f, "%u %u", &w, &h);
+          if ( r < 2 ) {
+             printf("Could not find width / height -6- %d %d %d\n", r, w, h);
+             exit(0);
+          }
+          int ne = fpeek(f);
+          while(ne == ' ' || ne=='\n' || ne=='\t'){ getc(f); ne = fpeek(f); }
+          int d;
+          r = fscanf(f, "%u", &d);
+          if ( (r < 1) || ( d != 255 ) ){
+             printf("Illegal max size %u %u", d, r);
+             exit(0);
+          }
+          ne = fpeek(f);
+          while(ne == ' ' || ne=='\n' || ne=='\t'){ getc(f); ne = fpeek(f); }
+          imageData = (unsigned char*)malloc(4*w*h*(sizeof(unsigned char)));
+          for(y = h-1; y>=0; y--)
+             for(x = 0; x<w; x++){
+                int total = 4*(x+y*w);
+                imageData[total]=getc(f);
+                imageData[total+1]=getc(f);
+                imageData[total+2]=getc(f);
+                imageData[total+3] = 255;
+             }
+       }
+       else if(id=='3'){
+          int ne = fpeek(f);
+          while(ne == ' ' || ne=='\n' || ne=='\t'){ getc(f); ne = fpeek(f); }
+          while(fpeek(f)=='#'){
+             int rr;
+             do{
+                rr = getc(f);
+             } while(rr!='\n');
+          }
+          int r = fscanf(f, "%u %u", &w, &h);
+          if ( r < 2 ) {
+             printf("Could not find width / height -3- %d %d %d\n", r, w, h);
+             exit(0);
+          }
+          int d;
+          r = fscanf(f, "%u", &d);
+          if ( (r < 1) || ( d != 255 ) ){
+             printf("Illegal max size %d %d %d %d", d, r, w, d);
+             exit(0);
+          }
+          fseek(f, 1, SEEK_CUR); /* skip one byte, should be whitespace */
+          id = getc(f);
+          if(fpeek(f)=='#'){
+             int rr;
+             do{
+                rr = getc(f);
+             } while(rr!='\n');
+          }
+          imageData = (unsigned char*)malloc(4*w*h*(sizeof(unsigned char)));
+             
+          for(y = h-1; y>=0; y--)
+             for(x = 0; x<w; x++){
+                int total = 4*(x+y*w);
+                unsigned int tmp;
+                if (fscanf(f, "%u", &tmp) == EOF) {
+                   printf("Could not read byte\n");
+                   exit(1);
+                }
+                imageData[total] = (unsigned char)tmp;
+                if (fscanf(f, "%u", &tmp) == EOF) {
+                   printf("Could not read byte\n");
+                   exit(1);
+                }
+                imageData[total+1] = (unsigned char)tmp;
+                if (fscanf(f, "%u", &tmp) == EOF) {
+                   printf("Could not read byte\n");
+                   exit(1);
+                }
+                imageData[total+2] = (unsigned char)tmp;
+                imageData[total+3] = 255;
+             }
+       }
+       else{
+          
+          printf("Unknown PPM FILE!?\n");
+          exit(0);
+       }
+    
+    
+    }
+
+Dependencies:
+  Function calls:
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: malloc
+      Signature: void *(size_t) noexcept(true)
+      Defined at: /usr/include/stdlib.h:540:14
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: fseek
+      Signature: int (FILE *, long, int)
+      Defined at: /usr/include/stdio.h:713:12
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: fpeek
+      Signature: int (FILE *)
+      Defined at: /home/adiprerepa/college/cs598ape/598APE-HW1/src/Textures/texture.h:30:5
+    - Name: getc
+      Signature: int (FILE *)
+      Defined at: /usr/include/stdio.h:514:12
+    - Name: malloc
+      Signature: void *(size_t) noexcept(true)
+      Defined at: /usr/include/stdlib.h:540:14
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: fscanf
+      Signature: int (FILE *__restrict, const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:434:12
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+    - Name: printf
+      Signature: int (const char *__restrict, ...)
+      Defined at: /usr/include/stdio.h:356:12
+    - Name: exit
+      Signature: void (int) __attribute__((noreturn)) noexcept(true)
+      Defined at: /usr/include/stdlib.h:624:13
+  Types referenced:
+    - ImageTexture::ImageTexture
+------------------------------------------------------------
+
+
+Analysis Statistics:
+Token count: 3,286
+Estimated price: $0.0082
