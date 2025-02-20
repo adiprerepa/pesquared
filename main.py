@@ -11,7 +11,7 @@ from optimize_function import FunctionOptimizer, OptimizationResult
 # Load environment variables from .env file
 load_dotenv()
 
-def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_functions: int = 3) -> None:
+def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_functions: int = 3, model="gpt-4o") -> None:
     """
     Optimize the top hotspot functions in a loop.
     
@@ -23,7 +23,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_f
     """
     # Initialize analyzers
     stack_analyzer = StackAnalyzer(stacks_dir)
-    optimizer = FunctionOptimizer(openai_api_key=openai_key)
+    optimizer = FunctionOptimizer(openai_api_key=openai_key, model=model)
     config = DependencyExtractorConfig(
         include_function_locations=True,
         include_type_locations=True
@@ -119,6 +119,9 @@ def main():
     parser.add_argument('--debug',
                        action='store_true',
                        help='Enable debug output')
+    parser.add_argument('--model',
+                       default='gpt-3.5-turbo',
+                       help='OpenAI model to use for optimization (default: gpt-3.5-turbo)')
     
     args = parser.parse_args()
     
@@ -137,7 +140,8 @@ def main():
             codebase_dir,
             args.stacks_dir,
             openai_key,
-            args.num_functions
+            args.num_functions,
+            model=args.model
         )
     except Exception as e:
         print(f"Fatal error: {str(e)}")
