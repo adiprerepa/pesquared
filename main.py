@@ -7,11 +7,13 @@ from dotenv import load_dotenv
 from analyze_stacks import StackAnalyzer
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output
 from optimize_function import FunctionOptimizer, OptimizationResult
+from performance_verifier import PerformanceVerifier
+from hw1 import APEHW1
 
 # Load environment variables from .env file
 load_dotenv()
 
-def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_functions: int = 3, model="gpt-4o") -> None:
+def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o") -> None:
     """
     Optimize the top hotspot functions in a loop.
     
@@ -21,6 +23,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_f
         openai_key: OpenAI API key for optimization
         num_functions: Number of top functions to optimize (default: 3)
     """
+
     # Initialize analyzers
     stack_analyzer = StackAnalyzer(stacks_dir)
     optimizer = FunctionOptimizer(openai_api_key=openai_key, model=model)
@@ -68,7 +71,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_f
             # 3. Generate optimization using LLM
             print("Generating optimization...")
             try:
-                result = optimizer.optimize_function(codebase_dir, func.name, analysis)
+                result = optimizer.optimize_function(codebase_dir, func.name, analysis, optimized_count=optimized_count)
             except Exception as e:
                 print(f"Error generating optimization: {str(e)}")
                 print("Stack trace:")
@@ -88,12 +91,16 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, num_f
             
             print(f"\nSuccess! Created branch: {result.branch_name}")
             print(f"Modified file: {result.file_path}")
-            print("\nOptimization summary:")
-            print("-" * 60)
-            print(result.optimization_summary)
-            print("-" * 60)
             
-            optimized_count += 1
+            # 6. Verify performance improvement and tests pass
+            print("Verifying performance improvement...")
+            cur_perf = perf_verifier.get_performance()
+            new_perf = perf_verifier.get_performance(result.branch_name)
+            print(f"Current performance: {cur_perf}")
+            print(f"New performance: {new_perf}")
+            if perf_verifier.compare_performance(cur_perf, new_perf):
+                print("Performance improved!")
+                optimized_count += 1
             
         except Exception as e:
             print(f"Unexpected error optimizing function: {str(e)}")
@@ -134,12 +141,14 @@ def main():
     
     # Ensure codebase_dir is absolute path
     codebase_dir = os.path.abspath(args.codebase_dir)
+    pv = APEHW1(codebase_dir)
     
     try:
         optimize_hotspots(
             codebase_dir,
             args.stacks_dir,
             openai_key,
+            pv,
             args.num_functions,
             model=args.model
         )
