@@ -1,6 +1,5 @@
 import os, json, requests, git
 from utils.filetreeutils import FileTree
-from utils.frameworkutils import Framework
 
 def get_repo_size(owner, repo):
     url = f"https://api.github.com/repos/{owner}/{repo}"
@@ -14,7 +13,7 @@ def get_repo_size(owner, repo):
         print(f"Failed to fetch repository info: {response.status_code}")
         return None
 
-def clone_repo(repo_url: str, max_size_mb=100):
+def clone_repo(repo_url: str, branch='main', max_size_mb=10**6):
     pieces = repo_url.replace('.git', '').split('/')
     repo_name = pieces[-1]
     user_name = pieces[-2]
@@ -24,8 +23,10 @@ def clone_repo(repo_url: str, max_size_mb=100):
         return None
     local_repo_path = f'./tmp/{user_name}/{repo_name}'
     if os.path.exists(local_repo_path):
-        return git.Repo(local_repo_path)
-    return git.Repo.clone_from(repo_url, local_repo_path, depth=1)
+        repo = git.Repo(local_repo_path)
+        repo.git.checkout(branch)
+        return repo
+    return git.Repo.clone_from(repo_url, local_repo_path, branch=branch, depth=1)
 
 def wipe_repo(repo_path, exceptions=set()):
     for dir in os.listdir(repo_path):
@@ -39,17 +40,12 @@ def wipe_repo(repo_path, exceptions=set()):
                 wipe_repo(path)
             os.rmdir(os.path.join(repo_path, dir))
 
-def prepare_repo(repo_path, framework: Framework):
-    working_dir = framework.get_working_dir()
-    if not working_dir:
-        return "Invalid framework"
-    wipe_repo(repo_path)
-    os.makedirs(f'{repo_path}/{working_dir}', exist_ok=True)
-    return f'{repo_path}/{working_dir}'
-
 def create_branch(repo, base_name, branch_name):
     repo.git.checkout(base_name)
     repo.git.checkout('-b', branch_name)
+
+def change_branch(repo, branch_name):
+    repo.git.checkout(branch_name)
 
 def make_directories_from_tree(repo, tree: FileTree):
     for node in tree.nodes:

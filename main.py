@@ -10,6 +10,7 @@ from extract_deps import extract_dependencies, DependencyExtractorConfig, format
 from optimize_function import FunctionOptimizer, OptimizationResult
 from performance_verifier import PerformanceVerifier
 from hw1 import APEHW1
+from utils.gitutils import clone_repo, change_branch
 
 # Load environment variables from .env file
 load_dotenv()
@@ -136,6 +137,7 @@ def main():
     parser.add_argument('--num-functions', type=int, default=3, help='Number of top functions to optimize (default: 3)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--model', default='gpt-3.5-turbo', help='OpenAI model to use for optimization (default: gpt-3.5-turbo)')
+    parser.add_argument('--branch', help='Branch to optimize on')
     
     args = parser.parse_args()
     
@@ -147,14 +149,34 @@ def main():
         logger.error("Error: OpenAI API key required")
         logger.error("Set OPENAI_API_KEY environment variable or use --openai-key")
         return 1
+
+    if args.codebase_dir.startswith('https'):
+        # clone the repo
+        repo = clone_repo(args.codebase_dir, branch=args.branch)
+        if not repo:
+            logger.error("Failed to clone repository")
+            return 1
+        codebase_dir = os.path.abspath(repo.working_dir)
+    else:
+        raise ValueError("Codebase directory must be a URL")
     
-    codebase_dir = os.path.abspath(args.codebase_dir)
+
+    if not os.path.exists(args.stacks_dir):
+        # try appending stacks_dir path to codebase_dir
+        stacks_dir = os.path.join(codebase_dir, args.stacks_dir)
+        print(stacks_dir)
+        if not os.path.exists(stacks_dir):
+            logger.error("Error: Stacks directory not found")
+            return 1
+    else:
+        stacks_dir = os.path.abspath(args.stacks_dir)
+
     pv = APEHW1(codebase_dir)
     
     try:
         optimize_hotspots(
             codebase_dir,
-            args.stacks_dir,
+            stacks_dir,
             openai_key,
             pv,
             args.num_functions,
