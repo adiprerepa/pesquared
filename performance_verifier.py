@@ -24,6 +24,22 @@ class PerformanceVerifier(ABC):
         pass
 
     @abstractmethod
+    def validate_performance(self, performance) -> bool:
+        """
+        Validates a performance metric.
+        This method must be implemented by subclasses.
+        """
+        pass
+
+
+    @abstractmethod
+    def summarize_improvements(self, performance1, performance2, event="cycles") -> None:
+        """
+        Summarizes the performance improvements between two performance metrics.
+        This method must be implemented by subclasses.
+        """
+        pass
+    @abstractmethod
     def tests_pass(self, branch) -> bool:
         """
         Checks if the tests pass on a given branch.

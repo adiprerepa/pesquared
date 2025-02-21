@@ -6,7 +6,6 @@ import openai
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
-
 @dataclass
 class OptimizationResult:
     """Result of an LLM-based function optimization."""
@@ -142,7 +141,7 @@ Analysis:
             
             # Create optimization prompt
             prompt = self._create_optimization_prompt(function_name, analysis_output)
-            print(f"Prompt: {prompt}")
+            # print(f"Prompt: {prompt}")
             # return
             # Get optimization from LLM using new OpenAI API
             response = self.client.chat.completions.create(
@@ -179,7 +178,7 @@ Analysis:
                 original_function=original_function.strip(),
                 optimized_function=result['function'].strip(),
                 optimization_summary=result['explanation'].strip(),
-                branch_name=self._sanitize_branch_name(result['summary']),
+                branch_name=self._sanitize_branch_name(result['summary'], optimized_count=optimized_count),
                 file_path=original_file
             )
             
