@@ -6,7 +6,6 @@ import openai
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
-
 @dataclass
 class OptimizationResult:
     """Result of an LLM-based function optimization."""
@@ -73,14 +72,14 @@ Analysis:
 
 """
 
-    def _sanitize_branch_name(self, name: str) -> str:
+    def _sanitize_branch_name(self, name: str, optimized_count=0) -> str:
         """Convert an optimization summary into a valid git branch name."""
         # Replace spaces and special characters with hyphens
         name = re.sub(r'[^a-zA-Z0-9-]', '-', name.lower())
         # Remove consecutive hyphens
         name = re.sub(r'-+', '-', name)
         # Remove leading/trailing hyphens
-        return 'ai/' + name.strip('-')
+        return f"ai-{optimized_count}/{name.strip('-')}"
 
     def _parse_llm_response(self, response: str) -> Dict[str, str]:
         """Parse the LLM response into components."""
@@ -99,16 +98,19 @@ Analysis:
             
         # Extract optimized function
         function_match = re.search(r'OPTIMIZED_FUNCTION:\s*\n(.+?)(?=\Z)', 
-                                 response, re.DOTALL)
+                                response, re.DOTALL)
         if function_match:
-            parts['function'] = function_match.group(1).strip()
+            function_code = function_match.group(1).strip()
+            # Remove triple backticks and optional language specifier
+            function_code = re.sub(r'```[a-zA-Z]*\n?', '', function_code).strip()
+            parts['function'] = function_code
             
         return parts
 
     def optimize_function(self, 
                          codebase_dir: str,
                          function_name: str,
-                         analysis: DependencyAnalysis) -> OptimizationResult:
+                         analysis: DependencyAnalysis, optimized_count=0) -> OptimizationResult:
         """
         Optimize a function using LLM and create a git branch with the changes.
         
@@ -139,7 +141,7 @@ Analysis:
             
             # Create optimization prompt
             prompt = self._create_optimization_prompt(function_name, analysis_output)
-            print(f"Prompt: {prompt}")
+            # print(f"Prompt: {prompt}")
             # return
             # Get optimization from LLM using new OpenAI API
             response = self.client.chat.completions.create(
@@ -176,7 +178,7 @@ Analysis:
                 original_function=original_function.strip(),
                 optimized_function=result['function'].strip(),
                 optimization_summary=result['explanation'].strip(),
-                branch_name=self._sanitize_branch_name(result['summary']),
+                branch_name=self._sanitize_branch_name(result['summary'], optimized_count=optimized_count),
                 file_path=original_file
             )
             
