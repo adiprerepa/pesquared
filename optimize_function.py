@@ -23,13 +23,13 @@ class FunctionOptimizer:
     
     def __init__(self, 
                  openai_api_key: str,
-                 model: str = "gpt-4-turbo-preview"):
+                 model: str = "gpt-4o"):
         """
         Initialize the optimizer.
         
         Args:
             openai_api_key: OpenAI API key
-            model: OpenAI model to use (default: gpt-4-turbo-preview)
+            model: OpenAI model to use (default: gpt-4o)
         """
         self.model = model
         self.client = openai.OpenAI(api_key=openai_api_key)
@@ -42,9 +42,7 @@ class FunctionOptimizer:
 
 The analysis includes:
 1. The original function's implementation
-2. All type definitions it depends on
-3. All function calls it makes
-4. The complete context of how the function is used
+2. All definitions it depends on
 
 YOU CANNOT CHANGE THE SIGNATURE OR FUNCTIONALITY OF THE FUNCTION. If there are no fruitful otimizations, you can return the original function as is.
 

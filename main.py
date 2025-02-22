@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 from analyze_stacks import StackAnalyzer
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output
+from functiongraph import FunctionGraph
 from optimize_function import FunctionOptimizer, OptimizationResult
 from performance_verifier import PerformanceVerifier
 from hw1 import APEHW1
@@ -172,6 +173,8 @@ def main():
         stacks_dir = os.path.abspath(args.stacks_dir)
 
     pv = APEHW1(codebase_dir)
+
+    graph = FunctionGraph(codebase_dir)
     
     try:
         optimize_hotspots(

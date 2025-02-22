@@ -268,7 +268,7 @@ class DependencyExtractorConfig:
                  file_extensions=None,
                  include_function_locations=False,
                  include_type_locations=False,
-                 clang_lib_path="/usr/lib/llvm-15/lib"):
+                 clang_lib_path="/usr/lib/llvm-18/lib"):
         """
         Configuration for the dependency extractor.
         
