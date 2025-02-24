@@ -3,6 +3,7 @@
 import os
 import re
 import openai
+import anthropic
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
@@ -22,8 +23,9 @@ class FunctionOptimizer:
     """Handles LLM-based function optimization and git operations."""
     
     def __init__(self, 
-                 openai_api_key: str,
-                 model: str = "gpt-4-turbo-preview"):
+                 api_key: str,
+                 model: str = "gpt-4-turbo-preview",
+                 provider: str = "openai"):
         """
         Initialize the optimizer.
         
@@ -32,12 +34,25 @@ class FunctionOptimizer:
             model: OpenAI model to use (default: gpt-4-turbo-preview)
         """
         self.model = model
-        self.client = openai.OpenAI(api_key=openai_api_key)
+        self.provider = provider
+        if provider == "openai":
+            self.client = openai.OpenAI(api_key=api_key)
+        else:
+            self.client = anthropic.Anthropic(api_key=api_key)
 
     def _create_optimization_prompt(self, 
                                   function_name: str, 
-                                  analysis_output: str) -> str:
+                                  analysis_output: str,
+                                  feedback: str = None) -> str:
         """Create the prompt for the LLM optimization."""
+        feedback_section = ""
+        if feedback:
+            feedback_section = f"""
+IMPORTANT: A previous optimization attempt had issues. Please address the following feedback:
+{feedback}
+
+"""
+            
         return f"""You are an expert C++ performance optimization engineer. You will be given a detailed analysis of a C++ function and its dependencies. Your task is to optimize this function for better performance.
 
 The analysis includes:
@@ -47,7 +62,7 @@ The analysis includes:
 4. The complete context of how the function is used
 
 YOU CANNOT CHANGE THE SIGNATURE OR FUNCTIONALITY OF THE FUNCTION. If there are no fruitful otimizations, you can return the original function as is.
-
+{feedback_section}
 Please provide:
 1. An optimized version of the function that is a drop-in replacement with THE SAME SIGNATURE AND BEHAVIOR (or the original function if no optimizations are possible)
 2. A brief explanation of the optimizations made
@@ -117,6 +132,8 @@ Analysis:
         Args:
             codebase_dir: Directory containing the C++ codebase
             function_name: Name of the function to optimize
+            analysis: DependencyAnalysis object containing the function analysis
+            optimized_count: Counter for optimized functions (used for branch naming)
             
         Returns:
             OptimizationResult containing the optimization details
@@ -132,7 +149,6 @@ Analysis:
         
         try:
             # Get function analysis
-            # analysis = extract_dependencies(codebase_dir, function_name, config)
             analysis_output = format_analysis_output(
                 analysis.functions,
                 analysis.types,
@@ -141,21 +157,32 @@ Analysis:
             
             # Create optimization prompt
             prompt = self._create_optimization_prompt(function_name, analysis_output)
-            # print(f"Prompt: {prompt}")
-            # return
-            # Get optimization from LLM using new OpenAI API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert C++ performance optimization engineer."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=4000
-            )
+            
+            if self.provider == "openai":
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are an expert C++ performance optimization engineer."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                ).choices[0].message.content
+            else:
+                response = self.client.messages.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000  # optional, will use model's default if not specified
+                ).content[0].text
             
             # Parse LLM response
-            result = self._parse_llm_response(response.choices[0].message.content)
+            result = self._parse_llm_response(response)
             if not all(k in result for k in ['summary', 'explanation', 'function']):
                 raise ValueError("Invalid LLM response format")
             
@@ -184,6 +211,105 @@ Analysis:
             
         except Exception as e:
             raise ValueError(f"Optimization failed: {str(e)}")
+            
+    def optimize_function_with_feedback(self, 
+                         codebase_dir: str,
+                         function_name: str,
+                         analysis: DependencyAnalysis,
+                         previous_result: OptimizationResult,
+                         feedback: str,
+                         optimized_count=0) -> OptimizationResult:
+        """
+        Optimize a function using LLM with feedback from previous failed attempt.
+        
+        Args:
+            codebase_dir: Directory containing the C++ codebase
+            function_name: Name of the function to optimize
+            analysis: DependencyAnalysis object containing the function analysis
+            previous_result: The previous OptimizationResult that had issues
+            feedback: Error message or feedback about why the previous optimization failed
+            optimized_count: Counter for optimized functions (used for branch naming)
+            
+        Returns:
+            OptimizationResult containing the optimization details
+            
+        Raises:
+            ValueError: If function not found or optimization fails
+        """
+        config = DependencyExtractorConfig(
+            include_function_locations=True,
+            include_type_locations=True
+        )
+        
+        try:
+            # Get function analysis
+            analysis_output = format_analysis_output(
+                analysis.functions,
+                analysis.types,
+                config
+            )
+            
+            # Add previous optimized function to the feedback
+            enhanced_feedback = f"""
+{feedback}
+
+Your previous optimization attempt was:
+```cpp
+{previous_result.optimized_function}
+```
+
+Please fix the issues while maintaining performance improvements where possible.
+"""
+            
+            # Create optimization prompt with feedback
+            prompt = self._create_optimization_prompt(function_name, analysis_output, enhanced_feedback)
+            
+            if self.provider == "openai":
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are an expert C++ performance optimization engineer."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                ).choices[0].message.content
+            else:
+                response = self.client.messages.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                ).content[0].text
+            
+            # Parse LLM response
+            result = self._parse_llm_response(response)
+            if not all(k in result for k in ['summary', 'explanation', 'function']):
+                raise ValueError("Invalid LLM response format")
+            
+            # Get original function location and content from previous result
+            original_file = previous_result.file_path
+            original_function = previous_result.original_function
+            
+            # Create a new branch name with retry indicator
+            retry_branch_name = f"{previous_result.branch_name}-retry"
+            
+            # Create optimization result
+            return OptimizationResult(
+                original_function=original_function.strip(),
+                optimized_function=result['function'].strip(),
+                optimization_summary=f"{result['explanation'].strip()} (Retry with feedback)",
+                branch_name=retry_branch_name,
+                file_path=original_file
+            )
+            
+        except Exception as e:
+            raise ValueError(f"Optimization with feedback failed: {str(e)}")
 
     def apply_optimization(self, result: OptimizationResult, codebase_dir: str) -> None:
         """
@@ -201,7 +327,7 @@ Analysis:
             current_branch = os.popen('git -C {} rev-parse --abbrev-ref HEAD'.format(codebase_dir)).read().strip()
             
             # Create and checkout new branch
-            branch_cmd = f'git -C {codebase_dir} checkout -b {result.branch_name}'
+            branch_cmd = f'git -C {codebase_dir} checkout -b {result.branch_name} -q'
             if os.system(branch_cmd) != 0:
                 raise ValueError("Failed to create and checkout new branch")
             
@@ -243,12 +369,12 @@ Analysis:
                 raise ValueError("Failed to push changes")
             
             # Restore original branch
-            os.system(f'git -C {codebase_dir} checkout {current_branch}')
+            os.system(f'git -C {codebase_dir} checkout {current_branch} -q')
             
         except Exception as e:
             # Try to restore original branch
             try:
-                os.system(f'git -C {codebase_dir} checkout {current_branch}')
+                os.system(f'git -C {codebase_dir} checkout {current_branch} -q')
             except:
                 pass
             raise ValueError(f"Failed to apply optimization: {str(e)}")
