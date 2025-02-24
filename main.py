@@ -22,7 +22,7 @@ def setup_logger(debug: bool):
         level=level,
     )
 
-def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o") -> None:
+def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o", provider="openai") -> None:
     """
     Optimize the top hotspot functions in a loop.
     
@@ -35,7 +35,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_
 
     logger = logging.getLogger()
     stack_analyzer = StackAnalyzer(stacks_dir)
-    optimizer = FunctionOptimizer(openai_api_key=openai_key, model=model)
+    optimizer = FunctionOptimizer(api_key=api_key, model=model, provider=provider)
     config = DependencyExtractorConfig(
         include_function_locations=True,
         include_type_locations=True
@@ -103,15 +103,63 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_
             logger.info(f"Current performance: {cur_perf}")
             logger.info(f"New performance: {new_perf}")
 
-            if not perf_verifier.validate_performance(new_perf) or not perf_verifier.validate_performance(cur_perf):
-                # Performance measurement failed
-                logger.error("Performance measurement failed, likely due to compilation errors. Skipping...")
-                # todo this is where we can re-prompt the LLM to generate a syntactically correct function
-            elif perf_verifier.compare_performance(cur_perf, new_perf):
+            max_retries = 3  # Configurable number of retries
+            retry_count = 0
+            compilation_success = perf_verifier.validate_performance(new_perf) and perf_verifier.validate_performance(cur_perf)
+            tests_pass = perf_verifier.tests_pass(result.branch_name)
+            
+            while (not compilation_success or not tests_pass) and retry_count < max_retries:
+                retry_count += 1
+                if not compilation_success:
+                    logger.warning(f"Performance measurement failed (retry {retry_count}/{max_retries}), likely due to compilation errors.")
+                    error_msg = "Compilation failed. Please fix the code to ensure it compiles correctly."
+                elif not tests_pass:
+                    logger.warning(f"Tests failed on branch {result.branch_name} (retry {retry_count}/{max_retries}).")
+                    error_msg = "Tests failed. Please fix the code while maintaining the same functionality."
+                
+                logger.info("Re-prompting LLM to fix issues...")
+                try:
+                    # Create a new prompt that includes the error message
+                    fixed_result = optimizer.optimize_function_with_feedback(
+                        codebase_dir, 
+                        func.name, 
+                        analysis, 
+                        result,
+                        error_msg,
+                        optimized_count=optimized_count
+                    )
+                    
+                    # Apply the new optimization
+                    optimizer.apply_optimization(fixed_result, codebase_dir)
+                    
+                    # Re-check performance and tests
+                    cur_perf = perf_verifier.get_performance()
+                    new_perf = perf_verifier.get_performance(fixed_result.branch_name)
+                    compilation_success = perf_verifier.validate_performance(new_perf) and perf_verifier.validate_performance(cur_perf)
+                    tests_pass = perf_verifier.tests_pass(fixed_result.branch_name)
+                    
+                    # If successful, update the result
+                    if compilation_success and tests_pass:
+                        result = fixed_result
+                        logger.info(f"Fixed implementation successfully on retry {retry_count}")
+                except Exception as e:
+                    logger.error(f"Error during retry {retry_count}: {str(e)}")
+                    logger.debug(traceback.format_exc())
+            
+            # If we still have issues after all retries, skip this function
+            if not compilation_success:
+                logger.error(f"Performance measurement still failing after {max_retries} retries. Skipping...")
+                continue
+            if not tests_pass:
+                logger.error(f"Tests still failing after {max_retries} retries. Skipping...")
+                continue
+        
+            logger.info(f"Tests passed on branch {result.branch_name}")
+            if perf_verifier.compare_performance(cur_perf, new_perf):
                 logger.info("Performance improved!")
                 optimized_count += 1
                 # make this the new current branch
-                os.system(f'git -C {codebase_dir} checkout {result.branch_name}')
+                os.system(f'git -C {codebase_dir} checkout -q {result.branch_name}')
             
         except Exception as e:
             logger.error(f"Unexpected error optimizing function: {str(e)}")
@@ -132,20 +180,20 @@ def main():
     )
     parser.add_argument('codebase_dir', help='Directory containing the C++ codebase')
     parser.add_argument('stacks_dir', help='Directory containing the folded stack files')
-    parser.add_argument('--openai-key', help='OpenAI API key (or set OPENAI_API_KEY env var)')
     parser.add_argument('--num-functions', type=int, default=3, help='Number of top functions to optimize (default: 3)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--model', default='gpt-3.5-turbo', help='OpenAI model to use for optimization (default: gpt-3.5-turbo)')
-    
+    parser.add_argument('--provider', default='openai', help='API provider to use for optimization (default: openai)')
     args = parser.parse_args()
     
     setup_logger(args.debug)
     logger = logging.getLogger()
     
-    openai_key = args.openai_key or os.getenv('OPENAI_API_KEY')
-    if not openai_key:
-        logger.error("Error: OpenAI API key required")
-        logger.error("Set OPENAI_API_KEY environment variable or use --openai-key")
+    openai_key = os.getenv('OPENAI_API_KEY')
+    anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+    if not anthropic_key and not openai_key:
+        logger.error("Error: Anthropic API key required")
+        logger.error("Set ANTHROPIC_API_KEY environment variable")
         return 1
     
     codebase_dir = os.path.abspath(args.codebase_dir)
@@ -155,10 +203,11 @@ def main():
         optimize_hotspots(
             codebase_dir,
             args.stacks_dir,
-            openai_key,
+            openai_key if args.provider == 'openai' else anthropic_key,
             pv,
             args.num_functions,
-            model=args.model
+            model=args.model,
+            provider=args.provider
         )
     except Exception as e:
         logger.critical(f"Fatal error: {str(e)}")
