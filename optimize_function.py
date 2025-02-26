@@ -3,8 +3,9 @@
 import os
 import re
 import openai
+import anthropic
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
 @dataclass
 class OptimizationResult:
@@ -22,48 +23,55 @@ class FunctionOptimizer:
     """Handles LLM-based function optimization and git operations."""
     
     def __init__(self, 
-                 openai_api_key: str,
-                 model: str = "gpt-4-turbo-preview"):
+                 api_key: Optional[str] = None,
+                 model: str = "gpt-4-turbo-preview",
+                 provider: str = "openai"):
         """
         Initialize the optimizer.
         
         Args:
-            openai_api_key: OpenAI API key
-            model: OpenAI model to use (default: gpt-4-turbo-preview)
+            openai_api_key: OpenAI API key (required if provider is 'openai')
+            anthropic_api_key: Anthropic API key (required if provider is 'anthropic')
+            model: Model to use for optimization (default depends on provider)
+            provider: The LLM provider to use ('openai' or 'anthropic')
         """
         self.model = model
-        self.client = openai.OpenAI(api_key=openai_api_key)
+        self.provider = provider
+        
+        if provider == "openai":
+            if not api_key:
+                raise ValueError("OpenAI API key is required when provider is 'openai'")
+            self.client = openai.OpenAI(api_key=api_key)
+        elif provider == "anthropic":
+            if not api_key:
+                raise ValueError("Anthropic API key is required when provider is 'anthropic'")
+            self.client = anthropic.Anthropic(api_key=api_key)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
 
     def _create_optimization_prompt(self, 
                                   function_name: str, 
                                   analysis_output: str) -> str:
         """Create the prompt for the LLM optimization."""
-        return f"""You are an expert C++ performance optimization engineer. You will be given a detailed analysis of a C++ function and its dependencies. Your task is to optimize this function for better performance.
+        return f"""You are an expert C++ performance optimization engineer tasked with optimizing a function for better performance.
 
-The analysis includes:
-1. The original function's implementation
-2. All type definitions it depends on
-3. All function calls it makes
-4. The complete context of how the function is used
+CRITICAL REQUIREMENTS:
+1. DO NOT modify the function signature (parameter types, return type, name) - it MUST remain EXACTLY as provided
+2. DO NOT inline the function or merge it with others
+3. ONLY modify the internal implementation while preserving exact behavior
+4. If no valuable optimizations exist, return the original function unmodified
 
-YOU CANNOT CHANGE THE SIGNATURE OR FUNCTIONALITY OF THE FUNCTION. If there are no fruitful otimizations, you can return the original function as is.
+The provided analysis includes:
+- Original function implementation
+- All dependent type definitions
+- All function calls made
+- Complete usage context
 
-Please provide:
-1. An optimized version of the function that is a drop-in replacement with THE SAME SIGNATURE AND BEHAVIOR (or the original function if no optimizations are possible)
-2. A brief explanation of the optimizations made
-3. A short, git-branch-name-friendly summary of the main optimization (e.g. "vectorize-matrix-multiply" or "reduce-memory-allocations")
-
-Please format your response as follows:
-OPTIMIZATION_SUMMARY: <one-line summary suitable for a git branch name>
-EXPLANATION: <brief explanation of optimizations>
+Format your response exactly as:
+OPTIMIZATION_SUMMARY: <brief git-branch-friendly description>
+EXPLANATION: <concise explanation of optimizations>
 OPTIMIZED_FUNCTION:
-<optimized function code>
-
-The optimized function must:
-1. Be a drop-in replacement (same signature and behavior)
-2. Maintain the same external behavior and correctness
-3. Do not use any formatting in your response, what follows from OPTIMIZED_FUNCTION needs to be just the drop-in replacement code.
-4. Nothing else should be included in OPTIMIZED_FUNCTION except the optimized function code.
+<optimized code - no formatting, just the raw function code>
 
 Function to optimize: {function_name}
 
@@ -110,7 +118,8 @@ Analysis:
     def optimize_function(self, 
                          codebase_dir: str,
                          function_name: str,
-                         analysis: DependencyAnalysis, optimized_count=0) -> OptimizationResult:
+                         analysis: DependencyAnalysis, 
+                         optimized_count=0) -> OptimizationResult:
         """
         Optimize a function using LLM and create a git branch with the changes.
         
@@ -143,19 +152,34 @@ Analysis:
             prompt = self._create_optimization_prompt(function_name, analysis_output)
             # print(f"Prompt: {prompt}")
             # return
-            # Get optimization from LLM using new OpenAI API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert C++ performance optimization engineer."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=4000
-            )
+            # Get optimization from LLM based on the selected provider
+            if self.provider == "openai":
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are an expert C++ performance optimization engineer."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                )
+                response_text = response.choices[0].message.content
+            elif self.provider == "anthropic":
+                response = self.client.messages.create(
+                    model=self.model,
+                    system="You are an expert C++ performance optimization engineer.",
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                )
+                response_text = response.content[0].text
+            else:
+                raise ValueError(f"Unsupported provider: {self.provider}")
             
             # Parse LLM response
-            result = self._parse_llm_response(response.choices[0].message.content)
+            result = self._parse_llm_response(response_text)
             if not all(k in result for k in ['summary', 'explanation', 'function']):
                 raise ValueError("Invalid LLM response format")
             
@@ -266,23 +290,48 @@ def main():
                        help='Name of the function to optimize')
     parser.add_argument('--openai-key',
                        help='OpenAI API key (or set OPENAI_API_KEY env var)')
+    parser.add_argument('--anthropic-key',
+                       help='Anthropic API key (or set ANTHROPIC_API_KEY env var)')
+    parser.add_argument('--provider', 
+                       choices=['openai', 'anthropic'], 
+                       default='openai',
+                       help='LLM provider to use (default: openai)')
     parser.add_argument('--model',
                        default='gpt-4-turbo-preview',
-                       help='OpenAI model to use')
+                       help='Model to use (defaults depend on provider)')
     
     args = parser.parse_args()
     
-    # Get API key from args or environment
-    api_key = args.openai_key or os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        print("Error: OpenAI API key required. Set OPENAI_API_KEY or use --openai-key")
-        return
+    # Set default model based on provider if not specified by user
+    if args.provider == 'anthropic' and args.model == 'gpt-4-turbo-preview':
+        args.model = 'claude-3-opus-20240229'
+        
+    # Get API key from args or environment based on provider
+    api_key = None
+    if args.provider == 'openai':
+        api_key = args.openai_key or os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            print("Error: OpenAI API key required. Set OPENAI_API_KEY or use --openai-key")
+            return
+    elif args.provider == 'anthropic':
+        api_key = args.anthropic_key or os.getenv('ANTHROPIC_API_KEY')
+        if not api_key:
+            print("Error: Anthropic API key required. Set ANTHROPIC_API_KEY or use --anthropic-key")
+            return
     
     try:
-        optimizer = FunctionOptimizer(
-            openai_api_key=api_key,
-            model=args.model
-        )
+        if args.provider == 'openai':
+            optimizer = FunctionOptimizer(
+                openai_api_key=api_key,
+                model=args.model,
+                provider=args.provider
+            )
+        elif args.provider == 'anthropic':
+            optimizer = FunctionOptimizer(
+                anthropic_api_key=api_key,
+                model=args.model,
+                provider=args.provider
+            )
         
         print(f"Analyzing function: {args.function_name}")
         result = optimizer.optimize_function(

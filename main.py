@@ -22,7 +22,7 @@ def setup_logger(debug: bool):
         level=level,
     )
 
-def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o") -> None:
+def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o", provider="openai") -> None:
     """
     Optimize the top hotspot functions in a loop.
     
@@ -35,7 +35,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_
 
     logger = logging.getLogger()
     stack_analyzer = StackAnalyzer(stacks_dir)
-    optimizer = FunctionOptimizer(openai_api_key=openai_key, model=model)
+    optimizer = FunctionOptimizer(api_key=api_key, model=model, provider=provider)
     config = DependencyExtractorConfig(
         include_function_locations=True,
         include_type_locations=True
@@ -107,11 +107,16 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, openai_key: str, perf_
                 # Performance measurement failed
                 logger.error("Performance measurement failed, likely due to compilation errors. Skipping...")
                 # todo this is where we can re-prompt the LLM to generate a syntactically correct function
-            elif perf_verifier.compare_performance(cur_perf, new_perf):
+            if not perf_verifier.tests_pass(result.branch_name):
+                logger.error("Tests failed on new branch. Skipping...")
+                continue
+        
+            logger.info(f"Tests passed on branch {result.branch_name}")
+            if perf_verifier.compare_performance(cur_perf, new_perf):
                 logger.info("Performance improved!")
                 optimized_count += 1
                 # make this the new current branch
-                os.system(f'git -C {codebase_dir} checkout {result.branch_name}')
+                os.system(f'git -C {codebase_dir} checkout -q {result.branch_name}')
             
         except Exception as e:
             logger.error(f"Unexpected error optimizing function: {str(e)}")
@@ -132,20 +137,20 @@ def main():
     )
     parser.add_argument('codebase_dir', help='Directory containing the C++ codebase')
     parser.add_argument('stacks_dir', help='Directory containing the folded stack files')
-    parser.add_argument('--openai-key', help='OpenAI API key (or set OPENAI_API_KEY env var)')
     parser.add_argument('--num-functions', type=int, default=3, help='Number of top functions to optimize (default: 3)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--model', default='gpt-3.5-turbo', help='OpenAI model to use for optimization (default: gpt-3.5-turbo)')
-    
+    parser.add_argument('--provider', default='openai', help='API provider to use for optimization (default: openai)')
     args = parser.parse_args()
     
     setup_logger(args.debug)
     logger = logging.getLogger()
     
-    openai_key = args.openai_key or os.getenv('OPENAI_API_KEY')
-    if not openai_key:
-        logger.error("Error: OpenAI API key required")
-        logger.error("Set OPENAI_API_KEY environment variable or use --openai-key")
+    openai_key = os.getenv('OPENAI_API_KEY')
+    anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+    if not anthropic_key and not openai_key:
+        logger.error("Error: Anthropic API key required")
+        logger.error("Set ANTHROPIC_API_KEY environment variable")
         return 1
     
     codebase_dir = os.path.abspath(args.codebase_dir)
@@ -155,10 +160,11 @@ def main():
         optimize_hotspots(
             codebase_dir,
             args.stacks_dir,
-            openai_key,
+            openai_key if args.provider == 'openai' else anthropic_key,
             pv,
             args.num_functions,
-            model=args.model
+            model=args.model,
+            provider=args.provider
         )
     except Exception as e:
         logger.critical(f"Fatal error: {str(e)}")
