@@ -24,13 +24,16 @@ def setup_logger(debug: bool):
 
 def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o", provider="openai") -> None:
     """
-    Optimize the top hotspot functions in a loop.
+    Optimize the top hotspot functions and their call chains in a loop.
     
     Args:
         codebase_dir: Directory containing the C++ codebase
         stacks_dir: Directory containing the folded stack files
-        openai_key: OpenAI API key for optimization
-        num_functions: Number of top functions to optimize (default: 3)
+        api_key: API key for the LLM provider
+        perf_verifier: Performance verification instance
+        num_functions: Number of top call chains to optimize (default: 3)
+        model: LLM model to use
+        provider: LLM provider (openai or anthropic)
     """
 
     logger = logging.getLogger()
@@ -42,13 +45,14 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
     )
     
     functions_iter = stack_analyzer.iter_functions()
-    optimized_count = 0
+    optimized_chains = 0
     
-    logger.info(f"Starting optimization loop for top {num_functions} hotspot functions...")
+    logger.info(f"Starting optimization loop for top {num_functions} hotspot call chains...")
 
     original_perf = perf_verifier.get_performance()
+    optimized_functions = set()  # Track all optimized functions to avoid repeats
     
-    while optimized_count < num_functions:
+    while optimized_chains < num_functions:
         try:
             func = next(functions_iter)
         except StopIteration:
@@ -58,73 +62,104 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
         if "[unknown]" in func.name or not func.name.strip():
             continue
         
-        logger.info(f"\nAnalyzing hotspot #{optimized_count + 1}:")
-        logger.info(f"Function: {func.name}")
+        # Skip if we've already processed this function
+        if func.name in optimized_functions:
+            continue
+            
+        # Log information about the current hotspot
+        logger.info(f"\nAnalyzing hotspot call chain #{optimized_chains + 1}:")
+        logger.info(f"Leaf function: {func.name}")
         logger.info(f"Exclusive time: {func.exclusive_time:,} samples")
         
-        try:
+        # Process the call chain if available
+        call_chain = func.call_chain if func.call_chain else [func.name]
+        
+        if len(call_chain) > 1:
+            logger.info(f"Call chain: {' -> '.join(call_chain)}")
+        
+        # Optimize each function in the call chain, starting from the root of the call chain
+        # This ensures that we optimize parent functions before their children
+        for idx, function_name in enumerate(reversed(call_chain)):
+            # Skip if we've already optimized this function
+            if function_name in optimized_functions:
+                logger.info(f"Function {function_name} already optimized, skipping...")
+                continue
+                
+            if "[unknown]" in function_name or not function_name.strip():
+                logger.info(f"Skipping unknown function in call chain: {function_name}")
+                continue
+            
+            logger.info(f"\nOptimizing function {idx+1}/{len(call_chain)} in call chain: {function_name}")
+            
             try:
-                analysis = extract_dependencies(codebase_dir, func.name, config)
-            except Exception as e:
-                logger.warning(f"Could not extract dependencies for function {func.name}, skipping...")
-                logger.debug(traceback.format_exc())
-                continue
-            
-            if not analysis.functions:
-                logger.warning(f"Could not find function {func.name} in codebase. Skipping...")
-                continue
-            
-            logger.info("Generating optimization...")
-            try:
-                result = optimizer.optimize_function(codebase_dir, func.name, analysis, optimized_count=optimized_count)
-            except Exception as e:
-                logger.error(f"Error generating optimization for function {func.name}, skipping...")
-                logger.debug(traceback.format_exc())
-                continue
-            
-            logger.info(f"Generated function: {result.optimized_function}")
-            if result.original_function in result.optimized_function:
-                logger.info("Optimization did not change the function. Skipping...")
-                continue
-            
-            logger.info("Applying optimization...")
-            try:
-                optimizer.apply_optimization(result, codebase_dir)
-            except Exception as e:
-                logger.error(f"Error applying optimization for function {func.name}, skipping...")
-                logger.debug(traceback.format_exc())
-                continue
-            
-            logger.info(f"\nSuccess! Modified file: {result.file_path}, Created branch: {result.branch_name}")
-            
-            logger.info("Verifying performance improvement...")
-            cur_perf = perf_verifier.get_performance()
-            new_perf = perf_verifier.get_performance(result.branch_name)
-            logger.info(f"Current performance: {cur_perf}")
-            logger.info(f"New performance: {new_perf}")
+                try:
+                    analysis = extract_dependencies(codebase_dir, function_name, config)
+                except Exception as e:
+                    logger.warning(f"Could not extract dependencies for function {function_name}, skipping...")
+                    logger.debug(traceback.format_exc())
+                    continue
+                
+                if not analysis.functions:
+                    logger.warning(f"Could not find function {function_name} in codebase. Skipping...")
+                    continue
+                
+                logger.info("Generating optimization...")
+                try:
+                    result = optimizer.optimize_function(codebase_dir, function_name, analysis, optimized_count=optimized_chains)
+                except Exception as e:
+                    logger.error(f"Error generating optimization for function {function_name}, skipping...")
+                    logger.debug(traceback.format_exc())
+                    continue
+                
+                logger.info(f"Generated function: {result.optimized_function}")
+                if result.original_function in result.optimized_function:
+                    logger.info("Optimization did not change the function. Skipping...")
+                    continue
+                
+                logger.info("Applying optimization...")
+                try:
+                    optimizer.apply_optimization(result, codebase_dir)
+                except Exception as e:
+                    logger.error(f"Error applying optimization for function {function_name}, skipping...")
+                    logger.debug(traceback.format_exc())
+                    continue
+                
+                logger.info(f"\nSuccess! Modified file: {result.file_path}, Created branch: {result.branch_name}")
+                
+                logger.info("Verifying performance improvement...")
+                cur_perf = perf_verifier.get_performance()
+                new_perf = perf_verifier.get_performance(result.branch_name)
+                logger.info(f"Current performance: {cur_perf}")
+                logger.info(f"New performance: {new_perf}")
 
-            if not perf_verifier.validate_performance(new_perf) or not perf_verifier.validate_performance(cur_perf):
-                # Performance measurement failed
-                logger.error("Performance measurement failed, likely due to compilation errors. Skipping...")
-                # todo this is where we can re-prompt the LLM to generate a syntactically correct function
-            if not perf_verifier.tests_pass(result.branch_name):
-                logger.error("Tests failed on new branch. Skipping...")
+                if not perf_verifier.validate_performance(new_perf) or not perf_verifier.validate_performance(cur_perf):
+                    # Performance measurement failed
+                    logger.error("Performance measurement failed, likely due to compilation errors. Skipping...")
+                    continue
+                    
+                if not perf_verifier.tests_pass(result.branch_name):
+                    logger.error("Tests failed on new branch. Skipping...")
+                    continue
+            
+                logger.info(f"Tests passed on branch {result.branch_name}")
+                if perf_verifier.compare_performance(cur_perf, new_perf):
+                    logger.info("Performance improved!")
+                    # Add to set of optimized functions
+                    optimized_functions.add(function_name)
+                    # make this the new current branch
+                    os.system(f'git -C {codebase_dir} checkout -q {result.branch_name}')
+                
+            except Exception as e:
+                logger.error(f"Unexpected error optimizing function: {str(e)}")
+                logger.debug(traceback.format_exc())
                 continue
         
-            logger.info(f"Tests passed on branch {result.branch_name}")
-            if perf_verifier.compare_performance(cur_perf, new_perf):
-                logger.info("Performance improved!")
-                optimized_count += 1
-                # make this the new current branch
-                os.system(f'git -C {codebase_dir} checkout -q {result.branch_name}')
-            
-        except Exception as e:
-            logger.error(f"Unexpected error optimizing function: {str(e)}")
-            logger.debug(traceback.format_exc())
-            continue
+        # Count this call chain as processed regardless of how many functions were successfully optimized
+        optimized_chains += 1
 
     final_perf = perf_verifier.get_performance()
     logger.info(f"\nOptimization loop complete.\n\nInitial performance: {original_perf}\nFinal performance: {final_perf}")
+    logger.info(f"Total functions optimized: {len(optimized_functions)}")
     perf_verifier.summarize_improvements(original_perf, final_perf, event="cycles")
     perf_verifier.summarize_improvements(original_perf, final_perf, event="task-clock")
     perf_verifier.summarize_improvements(original_perf, final_perf, event="instructions")
