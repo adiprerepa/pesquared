@@ -48,7 +48,7 @@ class APEHW1(PerformanceVerifier):
         
         if branch != "":
             # checkout branch
-            branch_cmd = f'git -C {self.codebase_dir} checkout {branch}'
+            branch_cmd = f'git -C {self.codebase_dir} checkout {branch} -q'
             if os.system(branch_cmd) != 0:
                 raise ValueError("Failed to create and checkout new branch")
         
@@ -68,7 +68,7 @@ class APEHW1(PerformanceVerifier):
         os.system(f'sudo rm -rf {self.codebase_dir}/perf')
 
         if branch != "":
-            os.system(f'git -C {self.codebase_dir} stash -q && git -C {self.codebase_dir} checkout {current_branch}')
+            os.system(f'git -C {self.codebase_dir} stash -q && git -C {self.codebase_dir} checkout {current_branch} -q')
 
         return perf
     
@@ -133,5 +133,50 @@ class APEHW1(PerformanceVerifier):
             print(f"\nEvent: {event}\n{table}")  # Ensures event type is displayed
 
 
-    def tests_pass(self, branch) -> bool:
-        pass
+    def tests_pass(self, branch="") -> bool:
+        # Save current branch name 
+        current_branch = os.popen('git -C {} rev-parse --abbrev-ref HEAD'.format(self.codebase_dir)).read().strip()
+        
+        if branch != "":
+            # checkout branch
+            branch_cmd = f'git -C {self.codebase_dir} checkout {branch} -q'
+            if os.system(branch_cmd) != 0:
+                raise ValueError("Failed to checkout branch")
+        
+        output_dir = f"{self.codebase_dir}/output"
+        baseline_dir = f"{self.codebase_dir}/baseline-outputs"
+        
+        # Check if both directories exist
+        if not os.path.exists(output_dir) or not os.path.exists(baseline_dir):
+            logger.error(f"Missing directories: outputs or baseline-outputs")
+            
+            # Return to original branch if needed
+            if branch != "":
+                os.system(f'git -C {self.codebase_dir} checkout {current_branch} -q')
+                
+            return False
+        
+        # Get all .ppm files in both directories
+        output_files = [f for f in os.listdir(output_dir) if f.endswith('.ppm')]
+        baseline_files = [f for f in os.listdir(baseline_dir) if f.endswith('.ppm')]
+        
+        # Compare each output file with its corresponding baseline file
+        all_passed = True
+        for output_file in output_files:
+            # Check if the file exists in baseline-outputs
+            if output_file not in baseline_files:
+                logger.error(f"File {output_file} not found in baseline-outputs")
+                all_passed = False
+                continue
+            
+            # Compare file contents
+            with open(os.path.join(output_dir, output_file), 'rb') as f1, open(os.path.join(baseline_dir, output_file), 'rb') as f2:
+                if f1.read() != f2.read():
+                    logger.error(f"File {output_file} content doesn't match baseline")
+                    all_passed = False
+        
+        # Return to original branch if needed
+        if branch != "":
+            os.system(f'git -C {self.codebase_dir} checkout {current_branch} -q')
+            
+        return all_passed

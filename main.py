@@ -143,7 +143,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
             
                 logger.info(f"Tests passed on branch {result.branch_name}")
                 if perf_verifier.compare_performance(cur_perf, new_perf):
-                    logger.info("Performance improved!")
+                    logger.info(f"Performance improved ({function_name})!")
                     # Add to set of optimized functions
                     optimized_functions.add(function_name)
                     # make this the new current branch

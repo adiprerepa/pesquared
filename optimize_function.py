@@ -71,7 +71,7 @@ Format your response exactly as:
 OPTIMIZATION_SUMMARY: <brief git-branch-friendly description>
 EXPLANATION: <concise explanation of optimizations>
 OPTIMIZED_FUNCTION:
-<optimized code - no formatting, just the raw function code>
+<optimized code - no formatting, just the raw function code, no explanation after, surround with ```>
 
 Function to optimize: {function_name}
 
@@ -104,14 +104,11 @@ Analysis:
         if explanation_match:
             parts['explanation'] = explanation_match.group(1).strip()
             
-        # Extract optimized function
-        function_match = re.search(r'OPTIMIZED_FUNCTION:\s*\n(.+?)(?=\Z)', 
+        # Extract optimized function 
+        function_match = re.search(r'OPTIMIZED_FUNCTION:\s*\n(?:```(?:cpp)?\n)?(.*?)(?:```|\Z)', 
                                 response, re.DOTALL)
         if function_match:
-            function_code = function_match.group(1).strip()
-            # Remove triple backticks and optional language specifier
-            function_code = re.sub(r'```[a-zA-Z]*\n?', '', function_code).strip()
-            parts['function'] = function_code
+            parts['function'] = function_match.group(1).strip()
             
         return parts
 
