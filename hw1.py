@@ -3,6 +3,7 @@ import os
 import json
 import logging
 from tabulate import tabulate
+from typing import Dict, Tuple
 
 logger = logging.getLogger()
 class APEHW1(PerformanceVerifier):
@@ -42,13 +43,13 @@ class APEHW1(PerformanceVerifier):
                 result[subdir_name] = self.get_counter_value(file_path)
         return result
     
-    def get_performance(self, branch=""):
+    def get_performance(self, branch="") -> Tuple[Dict, bool]:
         # Save current branch name 
         current_branch = os.popen('git -C {} rev-parse --abbrev-ref HEAD'.format(self.codebase_dir)).read().strip()
         
         if branch != "":
             # checkout branch
-            branch_cmd = f'git -C {self.codebase_dir} checkout {branch}'
+            branch_cmd = f'git -C {self.codebase_dir} checkout {branch} -q'
             if os.system(branch_cmd) != 0:
                 raise ValueError("Failed to create and checkout new branch")
         
@@ -65,16 +66,72 @@ class APEHW1(PerformanceVerifier):
 
         perf = self.get_counters_from_directory(f"{self.codebase_dir}/perf")
 
+        tests_passed = self.tests_pass()
+
         os.system(f'sudo rm -rf {self.codebase_dir}/perf')
 
         if branch != "":
-            os.system(f'git -C {self.codebase_dir} stash -q && git -C {self.codebase_dir} checkout {current_branch}')
+            os.system(f'git -C {self.codebase_dir} stash -q && git -C {self.codebase_dir} checkout {current_branch} -q')
 
-        return perf
+        return perf, tests_passed
     
 
     def validate_performance(self, perf: dict) -> bool:
-        return len(perf) == 3
+        """
+        Validate that performance was measured correctly.
+        
+        Args:
+            perf: Performance dictionary
+            
+        Returns:
+            True if performance is valid, False otherwise
+        """
+        return len(perf) == 3 and all(len(v) > 0 for v in perf.values())
+        
+    def get_compilation_error(self, branch="") -> str:
+        """
+        Get compilation error from the branch by running make in the container.
+        
+        Args:
+            branch: Branch to check for compilation errors
+            
+        Returns:
+            Compilation error message if error found, empty string if compilation succeeded
+        """
+        # Save current branch name 
+        current_branch = os.popen('git -C {} rev-parse --abbrev-ref HEAD'.format(self.codebase_dir)).read().strip()
+        
+        if branch != "":
+            # checkout branch
+            branch_cmd = f'git -C {self.codebase_dir} checkout {branch} -q'
+            if os.system(branch_cmd) != 0:
+                raise ValueError("Failed to checkout branch")
+        
+        # Run make command in the container to check for compilation errors
+        compile_cmd = f'docker run --privileged -it -v ~/college/cs598ape/598APE-HW1:/host adiprerepa/598ape /bin/bash -c "cd /host && make -j 2>&1"'
+        compile_output = os.popen(compile_cmd).read().strip()
+        
+        # Store the compilation result
+        result = ""
+        if "error" in compile_output.lower():
+            # Extract approximately 20 lines around the error (10 before, 10 after)
+            lines = compile_output.split('\n')
+            error_indices = [i for i, line in enumerate(lines) if "error" in line.lower()]
+            
+            if error_indices:
+                # Use the first error occurrence
+                error_index = error_indices[0]
+                start_index = max(0, error_index - 10)
+                end_index = min(len(lines), error_index + 10)
+                
+                # Extract the relevant lines
+                result = '\n'.join(lines[start_index:end_index])
+        
+        # Return to original branch if needed
+        if branch != "":
+            os.system(f'git -C {self.codebase_dir} checkout {current_branch} -q')
+            
+        return result
 
 
     def compare_performance(self, old: dict, new: dict) -> bool:
@@ -94,6 +151,11 @@ class APEHW1(PerformanceVerifier):
         if len(old) != len(new):
             # did not compile possibly
             return False
+        
+        # if the length of any of the objects in new is 0, then it did not compile
+        for workload in new:
+            if len(new[workload]) == 0:
+                return False
 
         weighted_percent_change = 0
 
@@ -133,5 +195,50 @@ class APEHW1(PerformanceVerifier):
             print(f"\nEvent: {event}\n{table}")  # Ensures event type is displayed
 
 
-    def tests_pass(self, branch) -> bool:
-        pass
+    def tests_pass(self, branch="") -> bool:
+        # Save current branch name 
+        current_branch = os.popen('git -C {} rev-parse --abbrev-ref HEAD'.format(self.codebase_dir)).read().strip()
+        
+        if branch != "":
+            # checkout branch
+            branch_cmd = f'git -C {self.codebase_dir} checkout {branch} -q'
+            if os.system(branch_cmd) != 0:
+                raise ValueError("Failed to checkout branch")
+        
+        output_dir = f"{self.codebase_dir}/output"
+        baseline_dir = f"{self.codebase_dir}/pesquared-baseline-output"
+        
+        # Check if both directories exist
+        if not os.path.exists(output_dir) or not os.path.exists(baseline_dir):
+            logger.error(f"Missing directories: outputs or baseline-outputs")
+            
+            # Return to original branch if needed
+            if branch != "":
+                os.system(f'git -C {self.codebase_dir} checkout {current_branch} -q')
+                
+            return False
+        
+        # Get all .ppm files in both directories
+        output_files = [f for f in os.listdir(output_dir) if f.endswith('.ppm')]
+        baseline_files = [f for f in os.listdir(baseline_dir) if f.endswith('.ppm')]
+        
+        # Compare each output file with its corresponding baseline file
+        all_passed = True
+        for output_file in output_files:
+            # Check if the file exists in baseline-outputs
+            if output_file not in baseline_files:
+                logger.error(f"File {output_file} not found in baseline-outputs")
+                all_passed = False
+                continue
+            
+            # Compare file contents
+            with open(os.path.join(output_dir, output_file), 'rb') as f1, open(os.path.join(baseline_dir, output_file), 'rb') as f2:
+                if f1.read() != f2.read():
+                    # logger.error(f"File {output_file} content doesn't match baseline")
+                    all_passed = False
+        
+        # Return to original branch if needed
+        if branch != "":
+            os.system(f'git -C {self.codebase_dir} checkout {current_branch} -q')
+            
+        return all_passed

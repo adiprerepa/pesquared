@@ -9,11 +9,14 @@ import re
 
 @dataclass
 class FunctionStats:
-    """Statistics for a single function."""
+    """Statistics for a single function or call chain."""
     name: str
     exclusive_time: int
+    call_chain: List[str] = None
 
     def __repr__(self) -> str:
+        if self.call_chain:
+            return f"FunctionStats(name='{self.name}', exclusive_time={self.exclusive_time}, call_chain={self.call_chain})"
         return f"FunctionStats(name='{self.name}', exclusive_time={self.exclusive_time})"
 
 class StackAnalyzer:
@@ -101,9 +104,9 @@ class StackAnalyzer:
         except (ValueError, IndexError):
             return [], 0
 
-    def _process_file(self, filepath: str) -> Dict[str, int]:
+    def _process_file(self, filepath: str) -> Dict[str, Dict[str, Union[int, List[str]]]]:
         """Process a single folded stack file."""
-        exclusive_times = defaultdict(int)
+        function_data = defaultdict(lambda: {"exclusive_time": 0, "call_chains": {}})
         
         with open(filepath, 'r') as f:
             for line in f:
@@ -116,21 +119,45 @@ class StackAnalyzer:
                 
                 # Only exclude if it matches kernel patterns
                 if not self._is_kernel_or_unknown_function(leaf_function):
-                    exclusive_times[leaf_function] += count
+                    # Store the call chain (reversed to show root->leaf order)
+                    # Remove duplicate adjacent frames (collapsed recursion)
+                    clean_frames = []
+                    for frame in frames:
+                        if not clean_frames or clean_frames[-1] != frame:
+                            clean_frames.append(frame)
+                    
+                    call_chain_tuple = tuple(clean_frames)
+                    
+                    # Update exclusive time for the leaf function
+                    function_data[leaf_function]["exclusive_time"] += count
+                    
+                    # Track this specific call chain and its count
+                    if call_chain_tuple in function_data[leaf_function]["call_chains"]:
+                        function_data[leaf_function]["call_chains"][call_chain_tuple] += count
+                    else:
+                        function_data[leaf_function]["call_chains"][call_chain_tuple] = count
         
-        return exclusive_times
+        return function_data
 
     def process(self) -> None:
-        """Process all stack files and compute exclusive times."""
+        """Process all stack files and compute exclusive times and call chains."""
         if self._is_processed:
             return
 
-        all_exclusive_times = defaultdict(int)
+        # Track both exclusive times and call chains
+        self._function_data = defaultdict(lambda: {"exclusive_time": 0, "call_chains": {}})
         
         if os.path.isfile(self.input_path):
             # Single file mode
-            file_times = self._process_file(self.input_path)
-            all_exclusive_times.update(file_times)
+            file_data = self._process_file(self.input_path)
+            # Merge file data into the overall function data
+            for func, data in file_data.items():
+                self._function_data[func]["exclusive_time"] += data["exclusive_time"]
+                for call_chain, count in data["call_chains"].items():
+                    if call_chain in self._function_data[func]["call_chains"]:
+                        self._function_data[func]["call_chains"][call_chain] += count
+                    else:
+                        self._function_data[func]["call_chains"][call_chain] = count
         else:
             # Directory mode
             for filename in os.listdir(self.input_path):
@@ -138,13 +165,19 @@ class StackAnalyzer:
                     continue
                 
                 filepath = os.path.join(self.input_path, filename)
-                file_times = self._process_file(filepath)
+                file_data = self._process_file(filepath)
                 
-                # Aggregate times across files
-                for func, time in file_times.items():
-                    all_exclusive_times[func] += time
+                # Merge file data into the overall function data
+                for func, data in file_data.items():
+                    self._function_data[func]["exclusive_time"] += data["exclusive_time"]
+                    for call_chain, count in data["call_chains"].items():
+                        if call_chain in self._function_data[func]["call_chains"]:
+                            self._function_data[func]["call_chains"][call_chain] += count
+                        else:
+                            self._function_data[func]["call_chains"][call_chain] = count
         
-        self._exclusive_times = all_exclusive_times
+        # Extract just the exclusive times for backward compatibility
+        self._exclusive_times = {func: data["exclusive_time"] for func, data in self._function_data.items()}
         self._is_processed = True
 
     def get_top_functions(self, n: int = 10) -> List[FunctionStats]:
@@ -155,7 +188,7 @@ class StackAnalyzer:
             n: Number of top functions to return
             
         Returns:
-            List of FunctionStats objects for the top N functions
+            List of FunctionStats objects for the top N functions with their most frequent call chains
         """
         if not self._is_processed:
             self.process()
@@ -163,15 +196,30 @@ class StackAnalyzer:
         sorted_funcs = sorted(self._exclusive_times.items(), 
                             key=lambda x: x[1], 
                             reverse=True)
-        return [FunctionStats(name=name, exclusive_time=time) 
-                for name, time in sorted_funcs[:n]]
+        
+        result = []
+        for name, time in sorted_funcs[:n]:
+            # Get the most frequent call chain for this function
+            call_chains = self._function_data[name]["call_chains"]
+            if call_chains:
+                # Get the call chain with the highest count
+                most_frequent_chain = max(call_chains.items(), key=lambda x: x[1])[0]
+                result.append(FunctionStats(
+                    name=name, 
+                    exclusive_time=time,
+                    call_chain=list(most_frequent_chain)
+                ))
+            else:
+                result.append(FunctionStats(name=name, exclusive_time=time))
+                
+        return result
 
     def iter_functions(self) -> Iterator[FunctionStats]:
         """
         Iterate over all functions in order of exclusive time.
         
         Returns:
-            Iterator yielding FunctionStats objects
+            Iterator yielding FunctionStats objects with their most frequent call chains
         """
         if not self._is_processed:
             self.process()
@@ -179,8 +227,20 @@ class StackAnalyzer:
         sorted_funcs = sorted(self._exclusive_times.items(), 
                             key=lambda x: x[1], 
                             reverse=True)
-        return (FunctionStats(name=name, exclusive_time=time) 
-                for name, time in sorted_funcs)
+        
+        for name, time in sorted_funcs:
+            # Get the most frequent call chain for this function
+            call_chains = self._function_data[name]["call_chains"]
+            if call_chains:
+                # Get the call chain with the highest count
+                most_frequent_chain = max(call_chains.items(), key=lambda x: x[1])[0]
+                yield FunctionStats(
+                    name=name, 
+                    exclusive_time=time,
+                    call_chain=list(most_frequent_chain)
+                )
+            else:
+                yield FunctionStats(name=name, exclusive_time=time)
 
     def get_function_stats(self, function_name: str) -> Union[FunctionStats, None]:
         """
@@ -190,16 +250,27 @@ class StackAnalyzer:
             function_name: Name of the function to get stats for
             
         Returns:
-            FunctionStats object if function exists, None otherwise
+            FunctionStats object with call chain if function exists, None otherwise
         """
         if not self._is_processed:
             self.process()
             
         if function_name in self._exclusive_times:
-            return FunctionStats(
-                name=function_name,
-                exclusive_time=self._exclusive_times[function_name]
-            )
+            # Get the most frequent call chain for this function
+            call_chains = self._function_data[function_name]["call_chains"]
+            if call_chains:
+                # Get the call chain with the highest count
+                most_frequent_chain = max(call_chains.items(), key=lambda x: x[1])[0]
+                return FunctionStats(
+                    name=function_name,
+                    exclusive_time=self._exclusive_times[function_name],
+                    call_chain=list(most_frequent_chain)
+                )
+            else:
+                return FunctionStats(
+                    name=function_name,
+                    exclusive_time=self._exclusive_times[function_name]
+                )
         return None
 
 def main():
@@ -208,6 +279,8 @@ def main():
                        help='Path to directory containing folded stack files or a single .folded file')
     parser.add_argument('-n', '--top_n', type=int, default=10,
                         help='Number of top functions to display (default: 10)')
+    parser.add_argument('--show-call-chains', action='store_true',
+                        help='Display the call chains for each function')
     args = parser.parse_args()
     
     analyzer = StackAnalyzer(args.input_path)
@@ -215,10 +288,12 @@ def main():
     
     # Print results
     print(f"\nTop {args.top_n} functions by exclusive time:")
-    print("-" * 60)
+    print("-" * 80)
     for idx, func in enumerate(top_functions, 1):
         print(f"{idx}. {func.name:<40} {func.exclusive_time:>15,} samples")
-    print("-" * 60)
+        if args.show_call_chains and func.call_chain:
+            print(f"   Call chain: {' -> '.join(func.call_chain)}")
+    print("-" * 80)
 
 if __name__ == "__main__":
     main() 
