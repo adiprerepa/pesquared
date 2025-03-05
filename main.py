@@ -9,7 +9,7 @@ from analyze_stacks import StackAnalyzer
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output
 from optimize_function import FunctionOptimizer, OptimizationResult
 from performance_verifier import PerformanceVerifier
-from hw1 import APEHW1
+from verifiers.hw1 import APEHW1
 
 # Load environment variables from .env file
 load_dotenv()
