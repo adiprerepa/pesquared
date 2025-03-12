@@ -9,18 +9,17 @@ from analyze_stacks import StackAnalyzer
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output
 from optimize_function import FunctionOptimizer, OptimizationResult
 from performance_verifier import PerformanceVerifier
-from hw1 import APEHW1
+from verifiers.hw1 import APEHW1
+from verifiers.hw2 import APEHW2
+import git_utils
 
 # Load environment variables from .env file
 load_dotenv()
 
-def setup_logger(debug: bool):
-    """Set up logger with specified debug level."""
+def setup_logger(debug: bool, codebase_dir: str = '.'):
+    """Set up logger with specified debug level and git branch prefix."""
     level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        level=level,
-    )
+    git_utils.setup_branch_logging(codebase_dir, level)
 
 def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o", provider="openai", correction_attempts: int = 2, temperature=0.7) -> None:
     """
@@ -150,85 +149,21 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
                 perf_verifier.summarize_improvements(cur_perf, new_perf, event="cycles")
                 
                 # Always check performance once, regardless of max_correction_attempts
-                success = False
                 if perf_verifier.validate_performance(new_perf) and perf_verifier.validate_performance(cur_perf):
                     # Performance validation successful, check if tests pass
                     if not new_pass:
                         logger.error("❌ Tests failed on branch. Skipping...")
                     else:
                         logger.info(f"✅ Tests passed on branch {current_result.branch_name}")
-                        if perf_verifier.compare_performane
-                        ce(cur_perf, new_perf):
+                        if perf_verifier.compare_performance(cur_perf, new_perf):
                             logger.info(f"Performance improved ({function_name})! Making {current_result.branch_name} the new current branch🚀")
                             # Add to set of optimized functions
                             optimized_functions.add(function_name)
                             # make this the new current branch
-                            os.system(f'git -C {codebase_dir} checkout -q {current_result.branch_name} -q')
-                        success = True
+                            git_utils.checkout_branch(current_result.branch_name, codebase_dir)
                 else:
-                    # Only enter correction loop if max_correction_attempts > 0
-                    while current_attempt < max_correction_attempts:
-                        # Performance measurement failed, likely due to compilation errors
-                        logger.warning("⚠️ Performance measurement failed, checking for compilation errors...")
-                        compilation_error = perf_verifier.get_compilation_error(current_result.branch_name)
-                        
-                        if not compilation_error:
-                            logger.error("❌ Performance validation failed but no compilation error found. Skipping...")
-                            break
-                            
-                        # We have a compilation error, try to fix it
-                        current_attempt += 1
-                        logger.info(f"🔨 Detected compilation errors. Re-prompting LLM with error details (attempt {current_attempt}/{max_correction_attempts})...")
-                        
-                        try:
-                            # Retry optimization with error feedback and call chain information
-                            corrected_result = optimizer.optimize_function(
-                                codebase_dir, 
-                                function_name, 
-                                analysis, 
-                                optimized_count=optimized_chains,
-                                compilation_error=compilation_error,
-                                previous_result=current_result,
-                                call_chain=call_chain,
-                                position_in_chain=len(call_chain) - 1 - idx  # Since we're iterating in reverse
-                            )
-                            
-                            logger.info(f"🔄 Generated corrected function. Applying optimization...")
-                            optimizer.apply_optimization(corrected_result, codebase_dir)
-                            current_result = corrected_result
-                            
-                        except Exception as e:
-                            logger.error(f"❌ Error during re-optimization: {str(e)}")
-                            logger.debug(traceback.format_exc())
-                            break
-                        
-                        # Re-verify performance after the correction attempt
-                        logger.info("📊 Re-verifying performance after correction attempt...")
-                        cur_perf, cur_pass = perf_verifier.get_performance()
-                        new_perf, new_pass = perf_verifier.get_performance(current_result.branch_name)
-                        logger.info(f"🧪 Test validation: current branch={cur_pass}, new branch={new_pass}\nPerformance:")
-                        perf_verifier.summarize_improvements(cur_perf, new_perf, event="cycles")
-                        
-                        if perf_verifier.validate_performance(new_perf) and perf_verifier.validate_performance(cur_perf):
-                            # Performance validation successful, check if tests pass
-                            if not new_pass:
-                                logger.error("❌ Tests failed on branch. Skipping...")
-                                break
-                                
-                            logger.info(f"✅ Tests passed on branch {current_result.branch_name}")
-                            if perf_verifier.compare_performance(cur_perf, new_perf):
-                                logger.info(f"Performance improved ({function_name})! Making {current_result.branch_name} the new current branch🚀")
-                                # Add to set of optimized functions
-                                optimized_functions.add(function_name)
-                                # make this the new current branch
-                                os.system(f'git -C {codebase_dir} checkout -q {current_result.branch_name} -q')
-                            success = True
-                            break
-                
-                # If we exhausted all attempts without success
-                if not success and current_attempt >= max_correction_attempts and (not perf_verifier.validate_performance(new_perf) or 
-                                                                 not perf_verifier.validate_performance(cur_perf)):
-                    logger.error(f"🙅 Giving up after {max_correction_attempts} correction attempts. Skipping function...")
+                    logger.error("❌ Performance validation failed. Skipping...")
+                    logger.error(f"  Current branch: {git_utils.get_current_branch(codebase_dir)}")
                 
             except Exception as e:
                 logger.error(f"💥 Unexpected error optimizing function: {str(e)}")
@@ -261,7 +196,8 @@ def main():
     parser.add_argument('--temperture', type=float, default=0.7, help='Temperature for sampling from the model (default: 0.0)')
     args = parser.parse_args()
     
-    setup_logger(args.debug)
+    codebase_dir = os.path.abspath(args.codebase_dir)
+    setup_logger(args.debug, codebase_dir)
     logger = logging.getLogger()
     
     openai_key = os.getenv('OPENAI_API_KEY')
@@ -271,8 +207,8 @@ def main():
         logger.error("🔑 Set ANTHROPIC_API_KEY environment variable")
         return 1
     
-    codebase_dir = os.path.abspath(args.codebase_dir)
-    pv = APEHW1(codebase_dir)
+    # pv = APEHW1(codebase_dir)
+    pv = APEHW2(codebase_dir)
     
     try:
         optimize_hotspots(
