@@ -51,37 +51,94 @@ def setup_clang():
 # Initialize clang when module is imported
 setup_clang()
 
+def normalize_template_name(name):
+    """
+    Normalize template names by removing template arguments.
+    Example: "genetic::stack<float, 20>::push" -> "genetic::stack::push"
+    """
+    # Simple template argument removal - handles basic cases
+    result = ""
+    depth = 0
+    for char in name:
+        if char == '<':
+            depth += 1
+            if depth == 1:  # Only replace the first level opening bracket with ::
+                result += "::"
+                continue
+        elif char == '>':
+            depth -= 1
+            continue
+        elif char == ',' and depth > 0:
+            continue
+        elif depth == 0:  # Only add characters when not inside template brackets
+            result += char
+    return result
+
 def find_function_in_cursor(cursor, target_name):
     """
     Recursively traverse the AST to find functions or methods whose spelling matches the target.
-    Handles both standalone functions and class methods.
+    Handles both standalone functions and class methods, including templated ones.
     """
     matches = []
+    
+    # Normalize the target name to handle templates
+    normalized_target = normalize_template_name(target_name)
+    
+    # Get just the method name (after the last ::)
+    method_name = target_name.split("::")[-1] if "::" in target_name else target_name
+    normalized_method = normalize_template_name(method_name)
+    
+    # For templated functions, also check for the base name without template params
+    base_method_name = method_name.split("<")[0] if "<" in method_name else method_name
     
     # Handle class methods and standalone functions
     if cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD):
         # Get fully qualified name for the function
         qualified_name = get_fully_qualified_name(cursor)
         
-        # Check for exact matches only
+        # Check for matches
         if (qualified_name == target_name or  # Exact match with qualified name
-            ("::" not in target_name and cursor.spelling == target_name)):  # Exact match with just function name
+            qualified_name == normalized_target or  # Match with normalized name
+            ("::" not in target_name and cursor.spelling == method_name) or  # Match with just function name
+            ("::" not in target_name and cursor.spelling == normalized_method) or  # Match with normalized function name
+            ("::" not in target_name and cursor.spelling == base_method_name)):  # Match with base method name (no template)
             matches.append(cursor)
     
-    # Also check class declarations for methods
-    elif cursor.kind == cindex.CursorKind.CLASS_DECL:
+    # Check class templates and regular class declarations for methods
+    elif cursor.kind in (cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE):
         class_name = cursor.spelling
-        # If we're looking for a method of this class
-        if "::" in target_name and target_name.startswith(f"{class_name}::"):
-            method_name = target_name.split("::")[-1]
+        class_qualified_name = get_fully_qualified_name(cursor)
+        
+        # If target_name starts with this class's name or a template variation of it
+        if ("::" in target_name and 
+            (target_name.startswith(f"{class_qualified_name}::") or
+             normalized_target.startswith(f"{class_qualified_name}::") or
+             # Handle case where the class is part of a template instance
+             (("<" in target_name) and 
+              (target_name.split("<")[0].endswith(class_name) or 
+               target_name.startswith(f"{class_name}<"))))):
+            
             # Search through class methods
             for child in cursor.get_children():
-                if child.kind == cindex.CursorKind.CXX_METHOD and child.spelling == method_name:
+                # Compare the method name with all possible variations
+                if child.kind == cindex.CursorKind.CXX_METHOD and (
+                   child.spelling == method_name or 
+                   child.spelling == normalized_method or
+                   child.spelling == base_method_name):
                     matches.append(child)
     
-    # Recurse through children
-    for child in cursor.get_children():
-        matches.extend(find_function_in_cursor(child, target_name))
+    # Check namespace declarations to help narrow down the search
+    elif cursor.kind == cindex.CursorKind.NAMESPACE:
+        namespace_name = cursor.spelling
+        if target_name.startswith(f"{namespace_name}::") or normalized_target.startswith(f"{namespace_name}::"):
+            # This namespace might contain our target, prioritize searching its children
+            for child in cursor.get_children():
+                matches.extend(find_function_in_cursor(child, target_name))
+    
+    # Recurse through children if we haven't found a match yet
+    if not matches:
+        for child in cursor.get_children():
+            matches.extend(find_function_in_cursor(child, target_name))
     
     return matches
 
@@ -99,7 +156,10 @@ def should_replace_type(current_file, new_file, current_type, new_type):
     return False
 
 def get_fully_qualified_name(cursor):
-    """Get the fully qualified name including namespaces and class names."""
+    """
+    Get the fully qualified name including namespaces and class names.
+    Handles templates appropriately.
+    """
     if cursor is None:
         return ""
     
@@ -109,13 +169,25 @@ def get_fully_qualified_name(cursor):
     
     while current and current.kind != cindex.CursorKind.TRANSLATION_UNIT:
         if current.kind in (cindex.CursorKind.NAMESPACE, 
-                          cindex.CursorKind.CLASS_DECL,
-                          cindex.CursorKind.STRUCT_DECL):
-            components.insert(0, current.spelling)
+                            cindex.CursorKind.CLASS_DECL,
+                            cindex.CursorKind.STRUCT_DECL,
+                            cindex.CursorKind.CLASS_TEMPLATE):
+            # For template classes, include the template parameters if available
+            if current.kind == cindex.CursorKind.CLASS_TEMPLATE:
+                # Try to get template parameters, but use just the name if we can't
+                template_name = current.spelling
+                components.insert(0, template_name)
+            else:
+                components.insert(0, current.spelling)
         current = current.semantic_parent
     
     # Add the function/method name
-    components.append(cursor.spelling)
+    if cursor.kind in (cindex.CursorKind.FUNCTION_TEMPLATE, 
+                      cindex.CursorKind.FUNCTION_DECL, 
+                      cindex.CursorKind.CXX_METHOD):
+        components.append(cursor.spelling)
+    else:
+        components.append(cursor.spelling)
     
     # Combine with :: separator
     return "::".join(components)
@@ -203,10 +275,13 @@ def parse_file(index, file_path, target_name):
             '-I/usr/local/include',
             '-I.',                    # Current directory
             '-Isrc',                  # Common source directory
+            '-Iinclude',              # Another common source directory
             '-I..',                   # Parent directory
             '-fparse-all-comments',   # Parse all comments
             '-Wno-unknown-warning-option',  # Ignore unknown warnings
             '-ferror-limit=0',        # Don't stop on errors
+            '-D__clang_analyzer__',   # Enable clang analyzer
+            '-ftemplate-depth=1024',  # Increase template recursion depth
         ]
         
         # Add the source directory and its parent to include paths
@@ -216,12 +291,32 @@ def parse_file(index, file_path, target_name):
             parent_dir = os.path.dirname(src_dir)
             if parent_dir:
                 compiler_args.extend([f'-I{parent_dir}'])
+                
+                # Add potential include directories that might exist in the project structure
+                potential_dirs = ['include', 'src', 'lib']
+                for p_dir in potential_dirs:
+                    full_path = os.path.join(parent_dir, p_dir)
+                    if os.path.isdir(full_path):
+                        compiler_args.extend([f'-I{full_path}'])
+        
+        # Process any template arguments in the target name for special handling
+        if '<' in target_name and '>' in target_name:
+            # Add defines to help with template parsing if needed
+            compiler_args.extend(['-fdelayed-template-parsing'])
         
         translation_unit = index.parse(
             file_path,
             args=compiler_args,
-            options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+            options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD | 
+                   cindex.TranslationUnit.PARSE_INCOMPLETE
         )
+        
+        # Check for parse errors that might affect template instantiation
+        # if translation_unit.diagnostics:
+        #     for diag in translation_unit.diagnostics:
+        #         if diag.severity >= cindex.Diagnostic.Error:
+        #             print(f"Parse error in {file_path}: {diag.spelling}")
+                    
     except Exception as e:
         print(f"Error parsing {file_path}: {e}")
         return None, None
@@ -322,6 +417,7 @@ def extract_dependencies(codebase_dir: str,
         FileNotFoundError: If codebase_dir doesn't exist
         RuntimeError: If function is not found or other analysis errors
     """
+    function_name = function_name.replace('\\<', '<').replace('\\>', '>').replace('\\,', ',')
     if not os.path.isdir(codebase_dir):
         raise FileNotFoundError(f"Directory not found: {codebase_dir}")
 
@@ -331,8 +427,35 @@ def extract_dependencies(codebase_dir: str,
 
     config = config or DependencyExtractorConfig()
     
-    # Find and analyze functions
-    found_functions, _ = scan_codebase(codebase_dir, function_name)
+    # Handle template types in function names
+    original_function_name = function_name
+    normalized_function_name = normalize_template_name(function_name)
+    
+    # Try with original name first, then with normalized name if needed
+    found_functions = []
+    translation_units = None
+    
+    # First try with the original name (with template parameters)
+    found_functions, translation_units = scan_codebase(codebase_dir, original_function_name)
+    
+    # If no results, try with normalized name (templates removed)
+    if not found_functions and normalized_function_name != original_function_name:
+        print(f"No matches found using '{original_function_name}'. Trying with normalized name: '{normalized_function_name}'")
+        found_functions, translation_units = scan_codebase(codebase_dir, normalized_function_name)
+    
+    # Last resort: try with just the function name (no namespaces/classes)
+    if not found_functions and "::" in original_function_name:
+        simple_name = original_function_name.split("::")[-1]
+        normalized_simple_name = normalize_template_name(simple_name)
+        
+        if simple_name != original_function_name:
+            print(f"No matches found. Trying with simple name: '{simple_name}'")
+            found_functions, translation_units = scan_codebase(codebase_dir, simple_name)
+        
+        if not found_functions and normalized_simple_name != simple_name:
+            print(f"No matches found. Trying with normalized simple name: '{normalized_simple_name}'")
+            found_functions, translation_units = scan_codebase(codebase_dir, normalized_simple_name)
+    
     if not found_functions:
         raise RuntimeError(f"Function '{function_name}' not found in codebase")
     
@@ -362,9 +485,12 @@ def extract_dependencies(codebase_dir: str,
                 if should_replace_type(current_file, new_file, current, type_info):
                     all_types[type_info["name"]] = type_info
         
+        # Get fully qualified name including template context if possible
+        qualified_name = get_fully_qualified_name(func)
+        
         # Create function analysis
         func_analysis = {
-            "name": get_fully_qualified_name(func),
+            "name": qualified_name,
             "location": (f"{func.location.file}:{func.location.line}:{func.location.column}" 
                         if func.location.file else "unknown"),
             "body": "",
@@ -377,9 +503,37 @@ def extract_dependencies(codebase_dir: str,
         # Get function body
         extent = func.extent
         if extent and extent.start.file:
-            with open(extent.start.file.name, 'r') as f:
-                source_lines = f.readlines()
-                func_analysis["body"] = ''.join(source_lines[extent.start.line-1:extent.end.line])
+            try:
+                with open(extent.start.file.name, 'r') as f:
+                    source_lines = f.readlines()
+                    # For templated functions, we may need to search for the complete implementation
+                    # Start with the basic extraction
+                    body_text = ''.join(source_lines[extent.start.line-1:extent.end.line])
+                    
+                    # If this seems incomplete (missing closing brace), search for the complete implementation
+                    if '{' in body_text and '}' not in body_text:
+                        # Find the matching closing brace
+                        open_braces = 0
+                        end_line = extent.end.line
+                        for i, line in enumerate(source_lines[extent.start.line-1:], extent.start.line-1):
+                            for char in line:
+                                if char == '{':
+                                    open_braces += 1
+                                elif char == '}':
+                                    open_braces -= 1
+                                    if open_braces == 0:
+                                        end_line = i + 1
+                                        break
+                            if open_braces == 0 and end_line > extent.end.line:
+                                break
+                        
+                        # Extract the complete body using the corrected end line
+                        body_text = ''.join(source_lines[extent.start.line-1:end_line])
+                    
+                    func_analysis["body"] = body_text
+            except Exception as e:
+                print(f"Error reading function body: {str(e)}")
+                func_analysis["body"] = f"Error: {str(e)}"
         
         # Add function calls
         for f in deps["functions"]:
@@ -462,10 +616,21 @@ def main():
     """Command-line interface for the dependency extractor."""
     if len(sys.argv) < 3:
         print("Usage: python extract_deps.py <codebase_directory> <function_name>")
+        print("\nExample: python extract_deps.py ./codebase genetic::stack<float, 20>::push")
+        print("Note: For templated functions, you can now use the full template syntax")
         sys.exit(1)
 
     try:
-        analysis = extract_dependencies(sys.argv[1], sys.argv[2])
+        # Combine all arguments after the codebase directory as the function name
+        # This allows for names with spaces and template parameters like "stack<int, 20>::push"
+        codebase_dir = sys.argv[1]
+        function_name = " ".join(sys.argv[2:])
+        
+        # Replace escaped characters that might come from shell
+        # function_name = function_name.replace('\\<', '<').replace('\\>', '>').replace('\\,', ',')
+        
+        print(f"Searching for function: {function_name}")
+        analysis = extract_dependencies(codebase_dir, function_name)
         print(format_analysis_output(
             analysis.functions, 
             analysis.types, 

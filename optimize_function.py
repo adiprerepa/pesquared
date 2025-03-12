@@ -4,9 +4,13 @@ import os
 import re
 import openai
 import anthropic
+import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Union
 from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
+import git_utils
+
+logger = logging.getLogger(__name__)
 @dataclass
 class OptimizationResult:
     """Result of an LLM-based function optimization."""
@@ -308,59 +312,51 @@ Please fix these errors in your new implementation while maintaining optimizatio
         """
         try:
             # Save current branch name
-            current_branch = os.popen('git -C {} rev-parse --abbrev-ref HEAD'.format(codebase_dir)).read().strip()
+            current_branch = git_utils.get_current_branch(codebase_dir)
             
             # Create and checkout new branch
-            branch_cmd = f'git -C {codebase_dir} checkout -b {result.branch_name} -q'
-            if os.system(branch_cmd) != 0:
+            if not git_utils.create_branch(result.branch_name, codebase_dir):
                 raise ValueError("Failed to create and checkout new branch")
             
-            # Read original file
-            print(f"Applying optimization to file: {result.file_path}")
-            with open(os.path.join(codebase_dir, result.file_path), 'r') as f:
-                content = f.read()
-            
-            # Replace function implementation
-            # Escape special regex characters in the original function
-            escaped_original = re.escape(result.original_function)
-            new_content = re.sub(
-                escaped_original,
-                result.optimized_function,
-                content
-            )
-            
-            # Write changes
-            with open(os.path.join(codebase_dir, result.file_path), 'w') as f:
-                f.write(new_content)
-            
-            # Stage and commit changes
-            file_relative_path = os.path.relpath(result.file_path, codebase_dir)
-            commit_msg = f"perf: {result.optimization_summary}\n\nOptimized {os.path.basename(result.file_path)}"
-            
-            # Stage changes
-            stage_cmd = f'git -C {codebase_dir} add {file_relative_path}'
-            if os.system(stage_cmd) != 0:
-                raise ValueError("Failed to stage changes")
-            
-            # Commit changes
-            commit_cmd = f'git -C {codebase_dir} commit -m "{commit_msg}"'
-            if os.system(commit_cmd) != 0:
-                raise ValueError("Failed to commit changes")
-            
-            # push changes
-            push_cmd = f'git -C {codebase_dir} push origin {result.branch_name}'
-            if os.system(push_cmd) != 0:
-                raise ValueError("Failed to push changes")
-            
-            # Restore original branch
-            os.system(f'git -C {codebase_dir} checkout {current_branch} -q')
+            try:
+                # Read original file
+                logger.info(f"Applying optimization to file: {result.file_path}")
+                with open(os.path.join(codebase_dir, result.file_path), 'r') as f:
+                    content = f.read()
+                
+                # Replace function implementation
+                # Escape special regex characters in the original function
+                escaped_original = re.escape(result.original_function)
+                new_content = re.sub(
+                    escaped_original,
+                    result.optimized_function,
+                    content
+                )
+                
+                # Write changes
+                with open(os.path.join(codebase_dir, result.file_path), 'w') as f:
+                    f.write(new_content)
+                
+                # Stage and commit changes
+                file_relative_path = os.path.relpath(result.file_path, codebase_dir)
+                commit_msg = f"perf: {result.optimization_summary}\n\nOptimized {os.path.basename(result.file_path)}"
+                
+                # Stage changes
+                if not git_utils.stage_file(file_relative_path, codebase_dir):
+                    raise ValueError("Failed to stage changes")
+                
+                # Commit changes
+                if not git_utils.commit_changes(commit_msg, codebase_dir):
+                    raise ValueError("Failed to commit changes")
+                
+                # push changes
+                if not git_utils.push_branch(result.branch_name, codebase_dir):
+                    raise ValueError("Failed to push changes")
+            finally:
+                # Always restore original branch
+                git_utils.checkout_branch(current_branch, codebase_dir)
             
         except Exception as e:
-            # Try to restore original branch
-            try:
-                os.system(f'git -C {codebase_dir} checkout {current_branch} -q')
-            except:
-                pass
             raise ValueError(f"Failed to apply optimization: {str(e)}")
 
 def main():
@@ -385,8 +381,15 @@ def main():
     parser.add_argument('--model',
                        default='gpt-4-turbo-preview',
                        help='Model to use (defaults depend on provider)')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug logging')
     
     args = parser.parse_args()
+    
+    # Set up logging with git branch prefix
+    codebase_dir = os.path.abspath(args.codebase_dir)
+    level = logging.DEBUG if args.debug else logging.INFO
+    git_utils.setup_branch_logging(codebase_dir, level)
     
     # Set default model based on provider if not specified by user
     if args.provider == 'anthropic' and args.model == 'gpt-4-turbo-preview':
@@ -397,47 +400,40 @@ def main():
     if args.provider == 'openai':
         api_key = args.openai_key or os.getenv('OPENAI_API_KEY')
         if not api_key:
-            print("Error: OpenAI API key required. Set OPENAI_API_KEY or use --openai-key")
+            logger.error("🔑 Error: OpenAI API key required. Set OPENAI_API_KEY or use --openai-key")
             return
     elif args.provider == 'anthropic':
         api_key = args.anthropic_key or os.getenv('ANTHROPIC_API_KEY')
         if not api_key:
-            print("Error: Anthropic API key required. Set ANTHROPIC_API_KEY or use --anthropic-key")
+            logger.error("🔑 Error: Anthropic API key required. Set ANTHROPIC_API_KEY or use --anthropic-key")
             return
     
     try:
-        if args.provider == 'openai':
-            optimizer = FunctionOptimizer(
-                openai_api_key=api_key,
-                model=args.model,
-                provider=args.provider
-            )
-        elif args.provider == 'anthropic':
-            optimizer = FunctionOptimizer(
-                anthropic_api_key=api_key,
-                model=args.model,
-                provider=args.provider
-            )
+        optimizer = FunctionOptimizer(
+            api_key=api_key,
+            model=args.model,
+            provider=args.provider
+        )
         
-        print(f"Analyzing function: {args.function_name}")
+        logger.info(f"🔍 Analyzing function: {args.function_name}")
         result = optimizer.optimize_function(
             args.codebase_dir,
             args.function_name
         )
         
-        print("\nOptimization Summary:")
-        print("-" * 60)
-        print(result.optimization_summary)
-        print("\nCreating branch and applying changes...")
+        logger.info("\n✨ Optimization Summary:")
+        logger.info("-" * 60)
+        logger.info(result.optimization_summary)
+        logger.info("\n🔧 Creating branch and applying changes...")
         
         optimizer.apply_optimization(result, args.codebase_dir)
         
-        print(f"\nSuccess! Created branch: {result.branch_name}")
-        print(f"Modified file: {result.file_path}")
-        print("\nReview the changes and merge if satisfied.")
+        logger.info(f"\n✅ Success! Created branch: {result.branch_name}")
+        logger.info(f"📝 Modified file: {result.file_path}")
+        logger.info("\n👀 Review the changes and merge if satisfied.")
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        logger.error(f"❌ Error: {str(e)}")
 
 if __name__ == '__main__':
     main() 
