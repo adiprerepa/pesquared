@@ -80,6 +80,7 @@ def find_function_in_cursor(cursor, target_name):
     Handles both standalone functions and class methods, including templated ones.
     """
     matches = []
+    print(f"Checking cursor: {cursor.spelling} ({cursor.kind}), target: {target_name}")
     
     # Normalize the target name to handle templates
     normalized_target = normalize_template_name(target_name)
@@ -266,6 +267,7 @@ def parse_file(index, file_path, target_name):
     """
     Parse a single file and return any matching function declarations along with the translation unit.
     """
+    print(f"Searching for '{target_name}' in {file_path}")
     try:
         # Add compiler arguments for modern C++
         compiler_args = [

@@ -4,14 +4,16 @@ import argparse
 import os
 import traceback
 import logging
+import signal
+import sys
 from dotenv import load_dotenv
-from analyze_stacks import StackAnalyzer
-from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output
-from optimize_function import FunctionOptimizer, OptimizationResult
-from performance_verifier import PerformanceVerifier
+from analyzers.stack_analyzer import StackAnalyzer
+from analyzers.dependency_extractor import extract_dependencies, DependencyExtractorConfig, format_analysis_output
+from optimizers.function_optimizer import FunctionOptimizer, OptimizationResult
+from verifiers.base_verifier import PerformanceVerifier
 from verifiers.hw1 import APEHW1
 from verifiers.hw2 import APEHW2
-import git_utils
+from utils import git_utils
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,7 +23,7 @@ def setup_logger(debug: bool, codebase_dir: str = '.'):
     level = logging.DEBUG if debug else logging.INFO
     git_utils.setup_branch_logging(codebase_dir, level)
 
-def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o", provider="openai", correction_attempts: int = 2, temperature=0.7) -> None:
+def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_verifier: PerformanceVerifier, num_functions: int = 3, model="gpt-4o", provider="openai", correction_attempts: int = 2, temperature=0.7, max_depth: int = None) -> None:
     """
     Optimize the top hotspot functions and their call chains in a loop.
     
@@ -34,6 +36,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
         model: LLM model to use
         provider: LLM provider (openai or anthropic)
         correction_attempts: Maximum number of attempts to correct compilation errors (default: 2)
+        max_depth: Maximum depth in the call chain to explore (default: None, which means no limit)
     """
 
     logger = logging.getLogger()
@@ -74,6 +77,12 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
         # Process the call chain if available
         call_chain = func.call_chain if func.call_chain else [func.name]
         
+        # If max_depth is set, limit the call chain to the specified depth
+        if max_depth is not None and len(call_chain) > max_depth:
+            logger.info(f"⚠️ Call chain depth ({len(call_chain)}) exceeds max depth ({max_depth}), truncating...")
+            # Keep the leaf function and max_depth-1 ancestors (to make a total of max_depth functions)
+            call_chain = call_chain[-(max_depth):]
+            
         if len(call_chain) > 1:
             logger.info(f"🔗 Call chain: {' -> '.join(call_chain)}")
         
@@ -140,7 +149,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
                 max_correction_attempts = correction_attempts
                 current_attempt = 0
                 current_result = result
-                
+
                 # Initialize performance variables before the loop to avoid UnboundLocalError
                 logger.info("📊 Verifying performance improvement...")
                 cur_perf, cur_pass = perf_verifier.get_performance()
@@ -179,6 +188,10 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
     perf_verifier.summarize_improvements(original_perf, final_perf, event="cycles")
     perf_verifier.summarize_improvements(original_perf, final_perf, event="task-clock")
     perf_verifier.summarize_improvements(original_perf, final_perf, event="instructions")
+    
+    # Display token usage and cost
+    from optimizers.function_optimizer import token_tracker
+    logger.info(token_tracker)
 
 
 
@@ -190,6 +203,7 @@ def main():
     parser.add_argument('stacks_dir', help='Directory containing the folded stack files')
     parser.add_argument('--num-functions', type=int, default=3, help='Number of top functions to optimize (default: 3)')
     parser.add_argument('--correction-attempts', type=int, default=2, help='Maximum number of attempts to correct compilation errors (default: 2)')
+    parser.add_argument('--max-depth', type=int, help='Maximum depth of call chain to explore from the leaf hotspot (default: no limit)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--model', default='gpt-3.5-turbo', help='OpenAI model to use for optimization (default: gpt-3.5-turbo)')
     parser.add_argument('--provider', default='openai', help='API provider to use for optimization (default: openai)')
@@ -209,7 +223,42 @@ def main():
     
     # pv = APEHW1(codebase_dir)
     pv = APEHW2(codebase_dir)
+
+    # Store original performance for Ctrl+C handler
+    original_perf, original_pass = pv.get_performance()
     
+    # Setup Ctrl+C handler
+    interrupt_count = 0
+    
+    def signal_handler(sig, frame):
+        nonlocal interrupt_count
+        interrupt_count += 1
+        
+        if interrupt_count == 1:
+            logger.info("\n🛑 Process interrupted by user (Ctrl+C)")
+            logger.info("Press Ctrl+C again to exit immediately without performance summary")
+            try:
+                final_perf, final_pass = pv.get_performance()
+                logger.info("📊 Performance Summary on Interrupt:")
+                pv.summarize_improvements(original_perf, final_perf, event="cycles")
+                pv.summarize_improvements(original_perf, final_perf, event="task-clock")
+                pv.summarize_improvements(original_perf, final_perf, event="instructions")
+                
+                # Display token usage and cost
+                from optimizers.function_optimizer import token_tracker
+                logger.info("📝 Token usage and cost:")
+                logger.info(token_tracker)
+                
+                sys.exit(0)
+            except Exception as e:
+                logger.error(f"Error generating performance summary: {str(e)}")
+                sys.exit(1)
+        else:
+            logger.info("\n🛑 Exiting immediately due to multiple interrupts")
+            sys.exit(1)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+
     try:
         optimize_hotspots(
             codebase_dir,
@@ -220,7 +269,8 @@ def main():
             model=args.model,
             provider=args.provider,
             correction_attempts=args.correction_attempts,
-            temperature=args.temperture
+            temperature=args.temperture,
+            max_depth=args.max_depth
         )
     except Exception as e:
         logger.critical(f"💥 Fatal error: {str(e)}")

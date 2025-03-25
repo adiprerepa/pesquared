@@ -7,10 +7,38 @@ import anthropic
 import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Union
-from extract_deps import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
-import git_utils
+from analyzers.dependency_extractor import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
+from utils import git_utils
 
 logger = logging.getLogger(__name__)
+
+# Token tracker for pricing calculation
+class TokenTracker:
+    """Track token usage and calculate costs."""
+    
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.input_cost_per_mtok = 3  # $3 per million tokens
+        self.output_cost_per_mtok = 15  # $15 per million tokens
+        
+    def add_usage(self, input_tokens: int, output_tokens: int):
+        """Add token usage to the tracker."""
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        
+    def get_cost(self):
+        """Calculate cost based on token usage."""
+        input_cost = (self.input_tokens / 1_000_000) * self.input_cost_per_mtok
+        output_cost = (self.output_tokens / 1_000_000) * self.output_cost_per_mtok
+        return input_cost, output_cost, input_cost + output_cost
+    
+    def __str__(self):
+        input_cost, output_cost, total_cost = self.get_cost()
+        return f"\033[38;5;28m💲 Token usage: {self.input_tokens:,} input, {self.output_tokens:,} output | Cost: ${total_cost:.4f} (Input: ${input_cost:.4f}, Output: ${output_cost:.4f})\033[0m"
+
+# Global token tracker
+token_tracker = TokenTracker()
 @dataclass
 class OptimizationResult:
     """Result of an LLM-based function optimization."""
@@ -216,13 +244,55 @@ Please fix these errors in your new implementation while maintaining optimizatio
             # Get original function location and body
             original_file = None
             original_function = None
+            cpp_file = None
+            cpp_function = None
+            header_file = None
+            header_function = None
+            logger.debug(f"found functions: {analysis.functions}")
+
+            # Define function to sanitize function names (remove templating)
+            def sanitize_function_name(name):
+                # Remove template parameters, e.g., stack<20>::push -> stack::push
+                return re.sub(r'<[^>]*>', '', name)
+            
+            # Sanitize the target function name
+            sanitized_target = sanitize_function_name(function_name)
+            
             for func in analysis.functions:
-                if func['name'] == function_name:
+                # Sanitize the current function name for comparison
+                sanitized_func_name = sanitize_function_name(func['name'])
+                
+                if sanitized_func_name == sanitized_target:
                     f = func['location'].split(':')[0]
-                    if f.endswith('.cpp'):
-                        original_file = f
-                        original_function = func['body']
-                        break
+                    # Prioritize implementation files (.cpp, .cc, .cxx)
+                    if f.endswith(('.cpp', '.cc', '.cxx')):
+                        cpp_file = f
+                        cpp_function = func['body']
+                        # If we find an implementation file with function body, use it immediately
+                        if cpp_function and len(cpp_function.strip()) > 0 and '{' in cpp_function:
+                            original_file = cpp_file
+                            original_function = cpp_function
+                            break
+                    # Otherwise capture header files (.h, .hpp, .hxx)
+                    elif f.endswith(('.h', '.hpp', '.hxx')):
+                        header_file = f
+                        header_function = func['body']
+                        # If we find a header with function body and not just declaration
+                        if header_function and len(header_function.strip()) > 0 and '{' in header_function:
+                            # Store but continue looking for cpp implementation
+                            if not original_file:
+                                original_file = header_file
+                                original_function = header_function
+            
+            # If we couldn't find any implementation, but have a cpp location, use it
+            if (not original_file or not original_function) and cpp_file:
+                original_file = cpp_file
+                original_function = cpp_function
+            
+            # If we still couldn't find any implementation, but have a header with body, use it
+            if (not original_file or not original_function) and header_file:
+                original_file = header_file
+                original_function = header_function
             
             if not original_file or not original_function:
                 raise ValueError(f"Could not locate original function: {function_name}")
@@ -266,6 +336,12 @@ Please fix these errors in your new implementation while maintaining optimizatio
                     max_tokens=4000
                 )
                 response_text = response.choices[0].message.content
+                
+                # Track token usage
+                token_tracker.add_usage(
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens
+                )
             elif self.provider == "anthropic":
                 response = self.client.messages.create(
                     model=self.model,
@@ -277,6 +353,12 @@ Please fix these errors in your new implementation while maintaining optimizatio
                     max_tokens=4000
                 )
                 response_text = response.content[0].text
+                
+                # Track token usage
+                token_tracker.add_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens
+                )
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
             
@@ -311,14 +393,12 @@ Please fix these errors in your new implementation while maintaining optimizatio
             ValueError: If git operations fail
         """
         try:
-            # Save current branch name
-            current_branch = git_utils.get_current_branch(codebase_dir)
-            
             # Create and checkout new branch
             if not git_utils.create_branch(result.branch_name, codebase_dir):
                 raise ValueError("Failed to create and checkout new branch")
             
-            try:
+            # Use temp_checkout context manager to automatically return to the original branch
+            with git_utils.temp_checkout(result.branch_name, codebase_dir):
                 # Read original file
                 logger.info(f"Applying optimization to file: {result.file_path}")
                 with open(os.path.join(codebase_dir, result.file_path), 'r') as f:
@@ -346,15 +426,12 @@ Please fix these errors in your new implementation while maintaining optimizatio
                     raise ValueError("Failed to stage changes")
                 
                 # Commit changes
-                if not git_utils.commit_changes(commit_msg, codebase_dir):
+                if not git_utils.commit_changes(commit_msg, codebase_dir, quiet=logger.level == logging.INFO):
                     raise ValueError("Failed to commit changes")
                 
                 # push changes
-                if not git_utils.push_branch(result.branch_name, codebase_dir):
+                if not git_utils.push_branch(result.branch_name, codebase_dir, quiet=logger.level == logging.INFO):
                     raise ValueError("Failed to push changes")
-            finally:
-                # Always restore original branch
-                git_utils.checkout_branch(current_branch, codebase_dir)
             
         except Exception as e:
             raise ValueError(f"Failed to apply optimization: {str(e)}")

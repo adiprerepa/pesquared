@@ -45,7 +45,7 @@ def checkout_branch(branch_name, codebase_dir='.', quiet=True):
 
 def create_branch(branch_name, codebase_dir='.', quiet=True):
     """
-    Create and checkout a new git branch
+    Create a new git branch
     
     Args:
         branch_name: Name of the new branch
@@ -57,7 +57,7 @@ def create_branch(branch_name, codebase_dir='.', quiet=True):
     """
     try:
         quiet_flag = "-q" if quiet else ""
-        cmd = f'git -C {codebase_dir} checkout -b {branch_name} {quiet_flag}'
+        cmd = f'git -C {codebase_dir} branch {branch_name} {quiet_flag}'
         result = os.system(cmd)
         return result == 0
     except Exception as e:
@@ -101,7 +101,7 @@ def stage_file(file_path, codebase_dir='.'):
         logger.error(f"Error staging file {file_path}: {e}")
         return False
 
-def commit_changes(message, codebase_dir='.'):
+def commit_changes(message, codebase_dir='.', quiet=True):
     """
     Commit staged changes
     
@@ -113,14 +113,15 @@ def commit_changes(message, codebase_dir='.'):
         True if successful, False otherwise
     """
     try:
-        cmd = f'git -C {codebase_dir} commit -m "{message}"'
+        quiet_flag = "-q" if quiet else ""
+        cmd = f'git -C {codebase_dir} commit -m "{message}" {quiet_flag}'
         result = os.system(cmd)
         return result == 0
     except Exception as e:
         logger.error(f"Error committing changes: {e}")
         return False
 
-def push_branch(branch_name, codebase_dir='.'):
+def push_branch(branch_name, codebase_dir='.', quiet=True):
     """
     Push branch to origin
     
@@ -132,7 +133,8 @@ def push_branch(branch_name, codebase_dir='.'):
         True if successful, False otherwise
     """
     try:
-        cmd = f'git -C {codebase_dir} push origin {branch_name}'
+        quiet_flag = "-q" if quiet else ""
+        cmd = f'git {quiet_flag} -C {codebase_dir} push origin {branch_name}'
         result = os.system(cmd)
         return result == 0
     except Exception as e:
@@ -164,6 +166,7 @@ def temp_checkout(branch_name, codebase_dir='.', quiet=True):
         return
         
     previous_branch = get_current_branch(codebase_dir)
+    logger.debug(f"Previous branch: {previous_branch}, checking out {branch_name}...")
     try:
         # Checkout the requested branch
         if not checkout_branch(branch_name, codebase_dir, quiet):
@@ -188,7 +191,7 @@ class GitBranchFilter(logging.Filter):
         
     def filter(self, record):
         branch = get_current_branch(self.codebase_dir)
-        record.git_branch = f"[{branch}]" if branch else ""
+        record.git_branch = f"\033[38;5;208m[{branch}]\033[0m" if branch else ""
         return True
 
 def setup_branch_logging(codebase_dir='.', log_level=logging.INFO):

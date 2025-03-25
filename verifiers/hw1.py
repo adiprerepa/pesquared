@@ -1,12 +1,10 @@
-from performance_verifier import PerformanceVerifier
+from verifiers.base_verifier import PerformanceVerifier
 import os
 import json
 import logging
 from tabulate import tabulate
 from typing import Dict, Tuple
-import sys
-sys.path.append('..')
-import git_utils
+from utils import git_utils
 
 logger = logging.getLogger()
 class APEHW1(PerformanceVerifier):
