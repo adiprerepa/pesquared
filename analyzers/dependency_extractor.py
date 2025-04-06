@@ -80,7 +80,7 @@ def find_function_in_cursor(cursor, target_name):
     Handles both standalone functions and class methods, including templated ones.
     """
     matches = []
-    print(f"Checking cursor: {cursor.spelling} ({cursor.kind}), target: {target_name}")
+    # print(f"Checking cursor: {cursor.spelling} ({cursor.kind}), target: {target_name}")
     
     # Normalize the target name to handle templates
     normalized_target = normalize_template_name(target_name)
@@ -92,8 +92,8 @@ def find_function_in_cursor(cursor, target_name):
     # For templated functions, also check for the base name without template params
     base_method_name = method_name.split("<")[0] if "<" in method_name else method_name
     
-    # Handle class methods and standalone functions
-    if cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD):
+    # Handle class methods and standalone functions (including function templates)
+    if cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD, cindex.CursorKind.FUNCTION_TEMPLATE):
         # Get fully qualified name for the function
         qualified_name = get_fully_qualified_name(cursor)
         
@@ -130,6 +130,7 @@ def find_function_in_cursor(cursor, target_name):
     
     # Check namespace declarations to help narrow down the search
     elif cursor.kind == cindex.CursorKind.NAMESPACE:
+        # print(f"Checking namespace: {cursor.spelling} (children names: {[c.spelling for c in cursor.get_children()]})")
         namespace_name = cursor.spelling
         if target_name.startswith(f"{namespace_name}::") or normalized_target.startswith(f"{namespace_name}::"):
             # This namespace might contain our target, prioritize searching its children
@@ -267,7 +268,7 @@ def parse_file(index, file_path, target_name):
     """
     Parse a single file and return any matching function declarations along with the translation unit.
     """
-    print(f"Searching for '{target_name}' in {file_path}")
+    # print(f"Searching for '{target_name}' in {file_path}")
     try:
         # Add compiler arguments for modern C++
         compiler_args = [
@@ -419,6 +420,15 @@ def extract_dependencies(codebase_dir: str,
         FileNotFoundError: If codebase_dir doesn't exist
         RuntimeError: If function is not found or other analysis errors
     """
+    # Remove potential return type in the function name
+    # E.g., "void genetic::meanSquareError<float>" -> "genetic::meanSquareError<float>"
+    if ' ' in function_name and '::' in function_name:
+        # Split by space and check if the second part has "::" indicating it's a namespaced function
+        parts = function_name.split(' ', 1)
+        if '::' in parts[1]:
+            function_name = parts[1]
+            print(f"Removed return type from function name: {function_name}")
+    
     function_name = function_name.replace('\\<', '<').replace('\\>', '>').replace('\\,', ',')
     if not os.path.isdir(codebase_dir):
         raise FileNotFoundError(f"Directory not found: {codebase_dir}")
@@ -620,6 +630,7 @@ def main():
         print("Usage: python extract_deps.py <codebase_directory> <function_name>")
         print("\nExample: python extract_deps.py ./codebase genetic::stack<float, 20>::push")
         print("Note: For templated functions, you can now use the full template syntax")
+        print("      Return types in function names (e.g., 'void genetic::foo') will be automatically removed")
         sys.exit(1)
 
     try:

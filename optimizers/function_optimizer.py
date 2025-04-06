@@ -252,8 +252,8 @@ Please fix these errors in your new implementation while maintaining optimizatio
 
             # Define function to sanitize function names (remove templating)
             def sanitize_function_name(name):
-                # Remove template parameters, e.g., stack<20>::push -> stack::push
-                return re.sub(r'<[^>]*>', '', name)
+                # Remove template parameters and ::, e.g., stack<20>::push -> push 
+                return re.sub(r'<.*?>', '', name).split('::')[-1]
             
             # Sanitize the target function name
             sanitized_target = sanitize_function_name(function_name)
@@ -261,6 +261,7 @@ Please fix these errors in your new implementation while maintaining optimizatio
             for func in analysis.functions:
                 # Sanitize the current function name for comparison
                 sanitized_func_name = sanitize_function_name(func['name'])
+                logger.debug(f"sanitized_func_name: {sanitized_func_name}, sanitized_target: {sanitized_target}, func: {func}")
                 
                 if sanitized_func_name == sanitized_target:
                     f = func['location'].split(':')[0]
@@ -268,6 +269,7 @@ Please fix these errors in your new implementation while maintaining optimizatio
                     if f.endswith(('.cpp', '.cc', '.cxx')):
                         cpp_file = f
                         cpp_function = func['body']
+                        logger.debug(f"cpp_file: {cpp_file}, cpp_function: {cpp_function}")
                         # If we find an implementation file with function body, use it immediately
                         if cpp_function and len(cpp_function.strip()) > 0 and '{' in cpp_function:
                             original_file = cpp_file

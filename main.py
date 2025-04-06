@@ -168,7 +168,9 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
                             logger.info(f"Performance improved ({function_name})! Making {current_result.branch_name} the new current branch🚀")
                             # Add to set of optimized functions
                             optimized_functions.add(function_name)
-                            # make this the new current branch
+                            
+                            
+                            # Make this the new current branch
                             git_utils.checkout_branch(current_result.branch_name, codebase_dir)
                 else:
                     logger.error("❌ Performance validation failed. Skipping...")
@@ -192,8 +194,107 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
     # Display token usage and cost
     from optimizers.function_optimizer import token_tracker
     logger.info(token_tracker)
+    
 
 
+
+def optimize_single_function(codebase_dir: str, function_name: str, api_key: str, perf_verifier: PerformanceVerifier, model="gpt-4o", provider="openai", correction_attempts: int = 2, temperature=0.7) -> None:
+    """
+    Optimize a single specified function without stack analysis.
+    
+    Args:
+        codebase_dir: Directory containing the C++ codebase
+        function_name: Name of the function to optimize
+        api_key: API key for the LLM provider
+        perf_verifier: Performance verification instance
+        model: LLM model to use
+        provider: LLM provider (openai or anthropic)
+        correction_attempts: Maximum number of attempts to correct compilation errors
+        temperature: Temperature for sampling from the model
+    """
+    
+    logger = logging.getLogger()
+    optimizer = FunctionOptimizer(api_key=api_key, model=model, provider=provider)
+    config = DependencyExtractorConfig(
+        include_function_locations=True,
+        include_type_locations=True
+    )
+    
+    logger.info(f"🚀 Optimizing single function: {function_name}")
+    
+    original_perf, original_pass = perf_verifier.get_performance()
+    
+    try:
+        # Extract dependencies for the function
+        try:
+            analysis = extract_dependencies(codebase_dir, function_name, config)
+        except Exception as e:
+            logger.error(f"⚠️ Could not extract dependencies for function {function_name}")
+            logger.debug(traceback.format_exc())
+            return
+        
+        if not analysis.functions:
+            logger.error(f"🔎 Could not find function {function_name} in codebase.")
+            return
+        
+        logger.info("🧠 Generating optimization...")
+        try:
+            # Optimize the function
+            result = optimizer.optimize_function(
+                codebase_dir, 
+                function_name, 
+                analysis,
+                temperature=temperature
+            )
+        except Exception as e:
+            logger.error(f"❌ Error generating optimization for function {function_name}")
+            logger.debug(traceback.format_exc())
+            return
+        
+        logger.info(f"✨ Generated function: {result.optimized_function}")
+        if result.original_function in result.optimized_function:
+            logger.info("🔄 Optimization did not change the function. Skipping...")
+            return
+        
+        logger.info("🔧 Applying optimization...")
+        try:
+            optimizer.apply_optimization(result, codebase_dir)
+        except Exception as e:
+            logger.error(f"❌ Error applying optimization for function {function_name}")
+            logger.debug(traceback.format_exc())
+            return
+        
+        logger.info(f"\n✅ Success! Modified file: {result.file_path}, Created branch: {result.branch_name}")
+        
+        # Verify performance improvement
+        logger.info("📊 Verifying performance improvement...")
+        cur_perf, cur_pass = perf_verifier.get_performance()
+        new_perf, new_pass = perf_verifier.get_performance(result.branch_name)
+        logger.info(f"🧪 Test validation: current branch={cur_pass}, new branch={new_pass}\nPerformance:")
+        perf_verifier.summarize_improvements(cur_perf, new_perf, event="cycles")
+        
+        if perf_verifier.validate_performance(new_perf) and perf_verifier.validate_performance(cur_perf):
+            if not new_pass:
+                logger.error("❌ Tests failed on branch. Skipping...")
+            else:
+                logger.info(f"✅ Tests passed on branch {result.branch_name}")
+                if perf_verifier.compare_performance(cur_perf, new_perf):
+                    logger.info(f"Performance improved! Making {result.branch_name} the new current branch🚀")
+                    
+                    
+                    # make this the new current branch
+                    git_utils.checkout_branch(result.branch_name, codebase_dir)
+        else:
+            logger.error("❌ Performance validation failed. Skipping...")
+    
+    except Exception as e:
+        logger.error(f"💥 Unexpected error optimizing function: {str(e)}")
+        logger.debug(traceback.format_exc())
+    
+    # Display token usage and cost
+    from optimizers.function_optimizer import token_tracker
+    logger.info(token_tracker)
+    
 
 def main():
     parser = argparse.ArgumentParser(
@@ -201,13 +302,14 @@ def main():
     )
     parser.add_argument('codebase_dir', help='Directory containing the C++ codebase')
     parser.add_argument('stacks_dir', help='Directory containing the folded stack files')
+    parser.add_argument('--function', help='Optimize a specific function instead of using stack analysis')
     parser.add_argument('--num-functions', type=int, default=3, help='Number of top functions to optimize (default: 3)')
     parser.add_argument('--correction-attempts', type=int, default=2, help='Maximum number of attempts to correct compilation errors (default: 2)')
     parser.add_argument('--max-depth', type=int, help='Maximum depth of call chain to explore from the leaf hotspot (default: no limit)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
-    parser.add_argument('--model', default='gpt-3.5-turbo', help='OpenAI model to use for optimization (default: gpt-3.5-turbo)')
+    parser.add_argument('--model', default='gpt-3.5-turbo', help='LLM model to use for optimization (default: gpt-3.5-turbo)')
     parser.add_argument('--provider', default='openai', help='API provider to use for optimization (default: openai)')
-    parser.add_argument('--temperture', type=float, default=0.7, help='Temperature for sampling from the model (default: 0.0)')
+    parser.add_argument('--temperature', type=float, default=0.7, help='Temperature for sampling from the model (default: 0.7)')
     args = parser.parse_args()
     
     codebase_dir = os.path.abspath(args.codebase_dir)
@@ -217,9 +319,12 @@ def main():
     openai_key = os.getenv('OPENAI_API_KEY')
     anthropic_key = os.getenv('ANTHROPIC_API_KEY')
     if not anthropic_key and not openai_key:
-        logger.error("🔑 Error: Anthropic API key required")
-        logger.error("🔑 Set ANTHROPIC_API_KEY environment variable")
+        logger.error("🔑 Error: API key required")
+        logger.error("🔑 Set OPENAI_API_KEY or ANTHROPIC_API_KEY environment variable")
         return 1
+    
+    # Select the appropriate API key based on provider
+    api_key = openai_key if args.provider == 'openai' else anthropic_key
     
     # pv = APEHW1(codebase_dir)
     pv = APEHW2(codebase_dir)
@@ -249,6 +354,7 @@ def main():
                 logger.info("📝 Token usage and cost:")
                 logger.info(token_tracker)
                 
+                
                 sys.exit(0)
             except Exception as e:
                 logger.error(f"Error generating performance summary: {str(e)}")
@@ -260,18 +366,33 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        optimize_hotspots(
-            codebase_dir,
-            args.stacks_dir,
-            openai_key if args.provider == 'openai' else anthropic_key,
-            pv,
-            args.num_functions,
-            model=args.model,
-            provider=args.provider,
-            correction_attempts=args.correction_attempts,
-            temperature=args.temperture,
-            max_depth=args.max_depth
-        )
+        # Check if a specific function was specified
+        if args.function:
+            # Skip stack analysis and optimize the single function
+            optimize_single_function(
+                codebase_dir,
+                args.function,
+                api_key,
+                pv,
+                model=args.model,
+                provider=args.provider,
+                correction_attempts=args.correction_attempts,
+                temperature=args.temperature
+            )
+        else:
+            # Use stack analysis to find and optimize hotspots
+            optimize_hotspots(
+                codebase_dir,
+                args.stacks_dir,
+                api_key,
+                pv,
+                args.num_functions,
+                model=args.model,
+                provider=args.provider,
+                correction_attempts=args.correction_attempts,
+                temperature=args.temperature,
+                max_depth=args.max_depth
+            )
     except Exception as e:
         logger.critical(f"💥 Fatal error: {str(e)}")
         logger.debug(traceback.format_exc())

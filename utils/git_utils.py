@@ -102,7 +102,7 @@ def stage_file(file_path, codebase_dir='.'):
         return False
 
 def commit_changes(message, codebase_dir='.', quiet=True):
-    """
+    """Junie
     Commit staged changes
     
     Args:
@@ -140,6 +140,7 @@ def push_branch(branch_name, codebase_dir='.', quiet=True):
     except Exception as e:
         logger.error(f"Error pushing branch {branch_name}: {e}")
         return False
+
 
 @contextmanager
 def temp_checkout(branch_name, codebase_dir='.', quiet=True):
