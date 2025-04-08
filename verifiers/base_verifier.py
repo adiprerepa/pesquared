@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
+
+from analyzers.clang_remark_analyzer import OptimizationRemark
+
 
 class PerformanceVerifier(ABC):
     """
@@ -18,6 +21,21 @@ class PerformanceVerifier(ABC):
             codebase_dir: Directory containing the codebase to verify
         """
         self.codebase_dir = codebase_dir
+
+    @abstractmethod
+    def get_remarks(self, branch="") -> List[OptimizationRemark]:
+        """
+        Retrieve a list of optimization remarks for a given branch.
+        
+        Args:
+            branch: The Git branch to analyze for optimization remarks
+                    (empty string defaults to the current branch).
+        
+        Returns:
+            A list of OptimizationRemark objects summarizing compiler
+            optimization diagnostics.
+        """
+        pass
 
     @abstractmethod
     def get_performance(self, branch="") -> Tuple[Dict, bool]:

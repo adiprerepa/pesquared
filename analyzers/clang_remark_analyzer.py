@@ -296,7 +296,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 clang_remark_analyzer.py <summary_yaml>")
         sys.exit(1)
-    summary_file = sys.argv[
+    summary_file = sys.argv[1]
 
     print(f"Parsing {summary_file}...")
     parsed_remarks = parse_optimization_summary(summary_file)
@@ -313,8 +313,13 @@ if __name__ == "__main__":
         other_count = 0
 
         index = index_remarks_by_function(remarks=parsed_remarks)
-        print(index['genetic::build_program(genetic::program&, genetic::param const&, PhiloxEngine&)'])
-
+        # Sort functions by number of missed optimizations (descending)
+        sorted_functions = sorted(index.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        print("\n--- Top 15 Functions by Missed Optimizations ---")
+        for i, (func_name, remarks) in enumerate(sorted_functions[:15], 1):
+            print(f"{i}. {func_name}: {len(remarks)} missed optimizations")
+        
         print("\n--- Example Remark Details ---")
         for remark in parsed_remarks[:15]: # Print details for first few
             print(remark.__str__())

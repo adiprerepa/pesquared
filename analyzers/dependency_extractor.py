@@ -1,5 +1,7 @@
 import os
 import sys
+import subprocess
+import re
 from clang import cindex
 import tiktoken
 
@@ -51,45 +53,155 @@ def setup_clang():
 # Initialize clang when module is imported
 setup_clang()
 
+def is_mangled_name(name):
+    """
+    Check if a function name appears to be in C++ mangled format.
+    C++ mangled names typically start with _Z, followed by a number and name components.
+    """
+    return name.startswith('_Z')
+
+def extract_components_from_mangled(mangled_name):
+    """
+    Extract components from a mangled name when c++filt fails.
+    This is a fallback mechanism to handle cases when c++filt cannot demangle a name.
+    
+    Examples:
+    _ZN7genetic6detail13evaluate_nodeERKNS_4nodeEPKfmmS5_ -> genetic::detail::evaluate_node
+    _ZN7genetic5stackIPfi20E4pushEf -> genetic::stack::push
+    
+    Note: This is a simplified approach and won't handle all mangling cases perfectly,
+    but it's good enough for basic function name matching.
+    
+    Returns the best effort demangled name.
+    """
+    if not mangled_name.startswith('_Z'):
+        return mangled_name
+    
+    # Special case handling for template classes with nested push method
+    # _ZN7genetic5stackIPfi20E4pushEf -> genetic::stack::push
+    # This regular expression tries to identify the pattern of mangled template classes
+    template_class_method = re.match(r'_ZN(\d+)([a-zA-Z0-9_]+)(\d+)([a-zA-Z0-9_]+)(?:I.*?E)(\d+)([a-zA-Z0-9_]+)', mangled_name)
+    if template_class_method:
+        namespace_len = int(template_class_method.group(1))
+        namespace = template_class_method.group(2)[:namespace_len]
+        class_len = int(template_class_method.group(3))
+        class_name = template_class_method.group(4)[:class_len]
+        method_len = int(template_class_method.group(5))
+        method_name = template_class_method.group(6)[:method_len]
+        return f"{namespace}::{class_name}::{method_name}"
+    
+    # For non-template cases or simpler cases, use the standard approach
+    # Remove _Z prefix
+    name = mangled_name[2:]
+    
+    parts = []
+    i = 0
+    while i < len(name):
+        if name[i] == 'N':
+            # Nested name, skip the N
+            i += 1
+        elif name[i].isdigit():
+            # Length-prefixed identifier
+            length = 0
+            while i < len(name) and name[i].isdigit():
+                length = length * 10 + int(name[i])
+                i += 1
+            if i + length <= len(name):
+                parts.append(name[i:i+length])
+                i += length
+            else:
+                # Invalid format, just return original
+                return mangled_name
+        elif name[i] == 'E':
+            # End of nested name
+            break
+        else:
+            # Skip over template parameter section (everything between I and E)
+            if name[i] == 'I':
+                template_depth = 1
+                i += 1
+                while i < len(name) and template_depth > 0:
+                    if name[i] == 'I':
+                        template_depth += 1
+                    elif name[i] == 'E':
+                        template_depth -= 1
+                    i += 1
+            else:
+                # Unknown component, just continue
+                i += 1
+            
+    if parts:
+        return '::'.join(parts)
+    return mangled_name
+
+
+def demangle_name(mangled_name, include_parameters=True):
+    """
+    Demangle a C++ mangled name using c++filt.
+    Returns the demangled name if successful, or the original name if demangling fails.
+    Also cleans up the demangled name to make it compatible with Clang's expectations.
+    
+    Args:
+        mangled_name: The mangled C++ name to demangle.
+        include_parameters: If True, retains parameter details in the demangled name.
+                            If False, strips parameter details.
+    """
+    try:
+        result = subprocess.run(['c++filt', mangled_name], capture_output=True, text=True)
+        if result.returncode == 0:
+            demangled = result.stdout.strip()
+
+            # If c++filt couldn't demangle it (returns the same string), try our fallback
+            if demangled == mangled_name and is_mangled_name(mangled_name):
+                print(f"c++filt failed to demangle {mangled_name}, using fallback")
+                return extract_components_from_mangled(mangled_name)
+
+            # Optionally remove parameter details if include_parameters is False
+            if not include_parameters:
+                # First find the template part if it exists
+                template_match = re.match(r'(.*?)(<.*?>)(.*?)(\()', demangled)
+                if template_match:
+                    # For template functions, combine the parts up to the opening parenthesis
+                    return (template_match.group(1) + template_match.group(2) + template_match.group(3)).strip()
+                else:
+                    # For regular functions, just remove everything from the first opening parenthesis
+                    match = re.match(r'([^(]+)(\(|$)', demangled)
+                    if match:
+                        return match.group(1).strip()
+
+            return demangled
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # If c++filt isn't available, try our fallback for mangled names
+        if is_mangled_name(mangled_name):
+            return extract_components_from_mangled(mangled_name)
+
+    return mangled_name
+
+
 def normalize_template_name(name):
     """
-    Normalize template names by removing template arguments.
-    Example: "genetic::stack<float, 20>::push" -> "genetic::stack::push"
+    Preserve mangled names as-is, since they're now the default.
+    This function is kept for backward compatibility but now acts as a pass-through.
     """
-    # Simple template argument removal - handles basic cases
-    result = ""
-    depth = 0
-    for char in name:
-        if char == '<':
-            depth += 1
-            if depth == 1:  # Only replace the first level opening bracket with ::
-                result += "::"
-                continue
-        elif char == '>':
-            depth -= 1
-            continue
-        elif char == ',' and depth > 0:
-            continue
-        elif depth == 0:  # Only add characters when not inside template brackets
-            result += char
-    return result
+    # Simply return the name as-is, preserving mangling
+    return name
 
 def find_function_in_cursor(cursor, target_name):
     """
     Recursively traverse the AST to find functions or methods whose spelling matches the target.
-    Handles both standalone functions and class methods, including templated ones.
+    Handles both standalone functions and class methods, including mangled names.
     """
     matches = []
     # print(f"Checking cursor: {cursor.spelling} ({cursor.kind}), target: {target_name}")
     
-    # Normalize the target name to handle templates
-    normalized_target = normalize_template_name(target_name)
+    # With mangled names as default, we keep the target name as-is
+    normalized_target = target_name
     
     # Get just the method name (after the last ::)
     method_name = target_name.split("::")[-1] if "::" in target_name else target_name
-    normalized_method = normalize_template_name(method_name)
+    normalized_method = method_name
     
-    # For templated functions, also check for the base name without template params
+    # For backward compatibility, also check the base name without template params
     base_method_name = method_name.split("<")[0] if "<" in method_name else method_name
     
     # Handle class methods and standalone functions (including function templates)
@@ -97,12 +209,10 @@ def find_function_in_cursor(cursor, target_name):
         # Get fully qualified name for the function
         qualified_name = get_fully_qualified_name(cursor)
         
-        # Check for matches
-        if (qualified_name == target_name or  # Exact match with qualified name
-            qualified_name == normalized_target or  # Match with normalized name
+        # Check for matches using mangled names
+        if (qualified_name == target_name or  # Exact match with qualified name (mangled)
             ("::" not in target_name and cursor.spelling == method_name) or  # Match with just function name
-            ("::" not in target_name and cursor.spelling == normalized_method) or  # Match with normalized function name
-            ("::" not in target_name and cursor.spelling == base_method_name)):  # Match with base method name (no template)
+            ("::" not in target_name and cursor.spelling == base_method_name)):  # Match with base method name (for compatibility)
             matches.append(cursor)
     
     # Check class templates and regular class declarations for methods
@@ -110,10 +220,9 @@ def find_function_in_cursor(cursor, target_name):
         class_name = cursor.spelling
         class_qualified_name = get_fully_qualified_name(cursor)
         
-        # If target_name starts with this class's name or a template variation of it
+        # If target_name starts with this class's name (preserve mangling)
         if ("::" in target_name and 
             (target_name.startswith(f"{class_qualified_name}::") or
-             normalized_target.startswith(f"{class_qualified_name}::") or
              # Handle case where the class is part of a template instance
              (("<" in target_name) and 
               (target_name.split("<")[0].endswith(class_name) or 
@@ -121,10 +230,9 @@ def find_function_in_cursor(cursor, target_name):
             
             # Search through class methods
             for child in cursor.get_children():
-                # Compare the method name with all possible variations
+                # Compare the method name (preserving mangling)
                 if child.kind == cindex.CursorKind.CXX_METHOD and (
-                   child.spelling == method_name or 
-                   child.spelling == normalized_method or
+                   child.spelling == method_name or
                    child.spelling == base_method_name):
                     matches.append(child)
     
@@ -132,7 +240,7 @@ def find_function_in_cursor(cursor, target_name):
     elif cursor.kind == cindex.CursorKind.NAMESPACE:
         # print(f"Checking namespace: {cursor.spelling} (children names: {[c.spelling for c in cursor.get_children()]})")
         namespace_name = cursor.spelling
-        if target_name.startswith(f"{namespace_name}::") or normalized_target.startswith(f"{namespace_name}::"):
+        if target_name.startswith(f"{namespace_name}::"):
             # This namespace might contain our target, prioritize searching its children
             for child in cursor.get_children():
                 matches.extend(find_function_in_cursor(child, target_name))
@@ -210,8 +318,16 @@ def collect_dependencies(cursor, dependencies=None):
             referenced = child.referenced
             if referenced is not None:
                 qualified_name = get_fully_qualified_name(referenced)
+                
+                # Always use demangled names for output to the LLM
+                if is_mangled_name(qualified_name):
+                    demangled_name = demangle_name(qualified_name)
+                    final_name = demangled_name
+                else:
+                    final_name = qualified_name
+                
                 func_info = {
-                    "name": qualified_name,
+                    "name": final_name,
                     "signature": referenced.type.spelling,
                     "location": (
                         f"{referenced.location.file}:{referenced.location.line}:"
@@ -229,6 +345,14 @@ def collect_dependencies(cursor, dependencies=None):
                 cindex.CursorKind.CLASS_DECL
             ):
                 qualified_name = get_fully_qualified_name(referenced)
+                
+                # Always use demangled names for output to the LLM
+                if is_mangled_name(qualified_name):
+                    demangled_name = demangle_name(qualified_name)
+                    final_name = demangled_name
+                else:
+                    final_name = qualified_name
+                    
                 extent = referenced.extent
                 body = ""
                 if extent and extent.start.file:
@@ -240,7 +364,7 @@ def collect_dependencies(cursor, dependencies=None):
                         body = f"Error reading source: {str(e)}"
                 
                 type_info = {
-                    "name": qualified_name,
+                    "name": final_name,
                     "location": (
                         f"{referenced.location.file}:{referenced.location.line}:"
                         f"{referenced.location.column}"
@@ -439,9 +563,23 @@ def extract_dependencies(codebase_dir: str,
 
     config = config or DependencyExtractorConfig()
     
-    # Handle template types in function names
+    # Handle different types of function names
     original_function_name = function_name
-    normalized_function_name = normalize_template_name(function_name)
+    
+    # Check if the function name is mangled
+    if is_mangled_name(function_name):
+        print(f"Detected mangled name: '{function_name}'")
+        # Try to demangle it
+        demangled_name = demangle_name(function_name, include_parameters=False)
+        if demangled_name != function_name:
+            print(f"Demangled to: '{demangled_name}'")
+            # Keep the original mangled name for reference
+            mangled_name = function_name
+            # Use the demangled name for the search since Clang uses demangled names internally
+            function_name = demangled_name
+            original_function_name = demangled_name
+    
+    normalized_function_name = normalize_template_name(original_function_name)
     
     # Try with original name first, then with normalized name if needed
     found_functions = []
@@ -500,9 +638,13 @@ def extract_dependencies(codebase_dir: str,
         # Get fully qualified name including template context if possible
         qualified_name = get_fully_qualified_name(func)
         
+        # Always use the demangled name for the LLM
+        # The LLM can't work with mangled names effectively
+        final_name = qualified_name
+        
         # Create function analysis
         func_analysis = {
-            "name": qualified_name,
+            "name": final_name,
             "location": (f"{func.location.file}:{func.location.line}:{func.location.column}" 
                         if func.location.file else "unknown"),
             "body": "",

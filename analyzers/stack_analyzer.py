@@ -64,17 +64,17 @@ class StackAnalyzer:
         return any(re.search(pattern, func_name) for pattern in self.KERNEL_PATTERNS)
 
     def _clean_function_name(self, func_name: str) -> str:
-        """Clean the function name by removing process prefixes and normalizing."""
+        """Clean the function name by removing process prefixes while preserving mangling."""
         # Remove process prefixes
         for prefix in self.PROCESS_PREFIXES:
             if func_name.startswith(prefix + ';'):
                 func_name = func_name[len(prefix) + 1:]
                 break
         
-        # Remove any remaining [unknown] parts from the path but keep function name
+        # Remove any remaining [unknown] parts from the path but keep function name with mangling
         parts = func_name.split(';')
         if parts:
-            # Keep the last part (the actual function name)
+            # Keep the last part (the actual function name) with its mangling
             func_name = parts[-1].strip()
             
         return func_name

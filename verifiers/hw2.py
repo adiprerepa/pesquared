@@ -3,8 +3,9 @@ import os
 import json
 import logging
 from tabulate import tabulate
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from utils import git_utils
+from analyzers.clang_remark_analyzer import OptimizationRemark, parse_optimization_summary
 
 logger = logging.getLogger()
 class APEHW2(PerformanceVerifier):
@@ -44,6 +45,29 @@ class APEHW2(PerformanceVerifier):
                 file_path = os.path.join(root, "perfstat.json")
                 result[subdir_name] = self.get_counter_value(file_path)
         return result
+
+    def get_remarks(self, branch="") -> List[OptimizationRemark]:
+        with git_utils.temp_checkout(branch, self.codebase_dir):
+            gen_remark_cmd = f'docker run --privileged -it -v ~/college/cs598ape/598APE-HW2:/host adiprerepa/598ape /bin/bash -c "cd /host && make clean && make"'
+            logger.debug(f"Running command (to generate remarks): {gen_remark_cmd}")
+            gen_remark_output = os.popen(gen_remark_cmd).read().strip()
+            logger.debug(f"gen_remark_output: {gen_remark_output}")
+
+            remarks_cmd = f"python3 scripts/parse_clang_remarks.py -o {self.codebase_dir}/missed_remarks_tmp.yaml {self.codebase_dir}/obj"
+            logger.debug(f"Running command (to parse remarks): {remarks_cmd}")
+            remarks_output = os.popen(remarks_cmd).read().strip()
+            logger.debug(f"remarks_output: {remarks_output}")
+
+            remarks = parse_optimization_summary(f"{self.codebase_dir}/missed_remarks_tmp.yaml")
+            logger.debug(f"got {len(remarks)} remarks")
+
+            os.system(f'sudo rm -rf {self.codebase_dir}/obj')
+            os.system(f'sudo rm {self.codebase_dir}/missed_remarks_tmp.yaml')
+
+            # Reset hard before returning to original branch
+            if branch:
+                git_utils.reset_hard(self.codebase_dir)
+            return remarks
     
     def get_performance(self, branch="") -> Tuple[Dict, bool]:
         with git_utils.temp_checkout(branch, self.codebase_dir):
@@ -59,7 +83,11 @@ class APEHW2(PerformanceVerifier):
 
             tests_passed = self.tests_pass()
 
+            remarks_cmd = f"python3 scripts/parse_clang_remarks.py -o {self.codebase_dir}/missed_remarks_tmp.yaml {self.codebase_dir}/obj/"
+
             os.system(f'sudo rm -rf {self.codebase_dir}/perf')
+            os.system(f'sudo rm -rf {self.codebase_dir}/obj')
+            os.system(f'sudo rm {self.codebase_dir}/missed_remarks_tmp.yaml')
             
             # Reset hard before returning to original branch
             if branch:

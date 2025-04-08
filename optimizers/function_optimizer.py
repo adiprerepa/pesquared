@@ -6,9 +6,10 @@ import openai
 import anthropic
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 from analyzers.dependency_extractor import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
 from utils import git_utils
+from analyzers.clang_remark_analyzer import OptimizationRemark
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +208,8 @@ Please fix these errors in your new implementation while maintaining optimizatio
                          previous_result: OptimizationResult = None,
                          temperature=0.7,
                          call_chain: list = None,
-                         position_in_chain: int = None) -> OptimizationResult:
+                         position_in_chain: int = None,
+                         function_remarks: List[OptimizationRemark]=[]) -> OptimizationResult:
         """
         Optimize a function using LLM and create a git branch with the changes.
         
@@ -220,6 +222,7 @@ Please fix these errors in your new implementation while maintaining optimizatio
             previous_result: Previous optimization result if this is a retry
             call_chain: The complete call chain this function is part of, from parent to child
             position_in_chain: The position of this function in the call chain (0-indexed)
+            function_remarks: list of clang remarks for the function
             
         Returns:
             OptimizationResult containing the optimization details
@@ -250,20 +253,50 @@ Please fix these errors in your new implementation while maintaining optimizatio
             header_function = None
             logger.debug(f"found functions: {analysis.functions}")
 
-            # Define function to sanitize function names (remove templating)
+            # Import the mangling detection and demangling functions
+            import sys
+            sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+            from analyzers.dependency_extractor import is_mangled_name, demangle_name
+            
+            # Define function to sanitize function names for comparison
             def sanitize_function_name(name):
-                # Remove template parameters and ::, e.g., stack<20>::push -> push 
-                return re.sub(r'<.*?>', '', name).split('::')[-1]
+                # If it's a mangled name, try to demangle it first
+                if is_mangled_name(name):
+                    demangled = demangle_name(name)
+                    # Use the demangled name if successful
+                    if demangled:
+                        name = demangled
+                
+                # Remove template parameters if present
+                name = re.sub(r'<.*?>', '', name)
+                # Remove parameter types if present
+                name = re.sub(r'\([^)]*\)', '', name)
+                # Remove whitespace
+                name = name.strip()
+                # Extract the last part after :: if it exists
+                name = name.split('::')[-1] if '::' in name else name
+                
+                return name
             
             # Sanitize the target function name
             sanitized_target = sanitize_function_name(function_name)
             
             for func in analysis.functions:
+                func_name = func['name']
+                # Handle mangled names first
+                if is_mangled_name(func_name):
+                    demangled = demangle_name(func_name)
+                    if demangled:
+                        func_name = demangled
+                
                 # Sanitize the current function name for comparison
-                sanitized_func_name = sanitize_function_name(func['name'])
+                sanitized_func_name = sanitize_function_name(func_name)
                 logger.debug(f"sanitized_func_name: {sanitized_func_name}, sanitized_target: {sanitized_target}, func: {func}")
                 
-                if sanitized_func_name == sanitized_target:
+                # More liberal match - check if one is contained in the other or vice versa
+                if (sanitized_func_name == sanitized_target or 
+                    sanitized_func_name in sanitized_target or 
+                    sanitized_target in sanitized_func_name):
                     f = func['location'].split(':')[0]
                     # Prioritize implementation files (.cpp, .cc, .cxx)
                     if f.endswith(('.cpp', '.cc', '.cxx')):

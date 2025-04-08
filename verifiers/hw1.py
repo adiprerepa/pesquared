@@ -1,13 +1,18 @@
+from analyzers.clang_remark_analyzer import OptimizationRemark
 from verifiers.base_verifier import PerformanceVerifier
 import os
 import json
 import logging
 from tabulate import tabulate
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from utils import git_utils
 
 logger = logging.getLogger()
 class APEHW1(PerformanceVerifier):
+
+    def get_remarks(self, branch=""):
+        logger.error("get_remarks not supported for APEHW1")
+        pass
 
     def __init__(self, codebase_dir: str):
         """
