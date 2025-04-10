@@ -192,11 +192,12 @@ class StackAnalyzer:
         """
         if not self._is_processed:
             self.process()
-            
+
         sorted_funcs = sorted(self._exclusive_times.items(), 
                             key=lambda x: x[1], 
                             reverse=True)
-        
+        print(f"sorted_funcs: {sorted_funcs}")
+
         result = []
         for name, time in sorted_funcs[:n]:
             # Get the most frequent call chain for this function

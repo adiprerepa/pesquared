@@ -90,6 +90,15 @@ class OptimizationRemark:
     def line(self) -> int:
         """Convenience property to get the line number."""
         return self.location.line
+        
+    def to_llm_friendly_string(self) -> str:
+        """Convert remark to LLM-friendly string format."""
+        base_info = f"PASS: {self.pass_name} | REASON: {self.miss_reason} | LOCATION: {self.location}"
+        
+        if self.info:
+            base_info += f" | INFO: {self.info}"
+            
+        return base_info
 
 
 class InlineRemark(OptimizationRemark):
@@ -128,6 +137,24 @@ class InlineRemark(OptimizationRemark):
              self.reason_location = SourceLocation(reason_data.get('DebugLoc'))
         elif isinstance(reason_data, str):
              self.reason_value = reason_data
+             
+    def to_llm_friendly_string(self) -> str:
+        """Convert inline remark to LLM-friendly string format."""
+        base = super().to_llm_friendly_string()
+        
+        extra_info = []
+        if self.cost is not None:
+            extra_info.append(f"COST: {self.cost}")
+        if self.threshold is not None:
+            extra_info.append(f"THRESHOLD: {self.threshold}")
+        if self.reason_value:
+            extra_info.append(f"REASON: {self.reason_value}")
+        if self.callee and self.callee.name:
+            extra_info.append(f"CALLEE: {self.callee.name}")
+        
+        if extra_info:
+            return f"{base} | {' | '.join(extra_info)}"
+        return base
 
 
 class GVNRemark(OptimizationRemark):
@@ -138,6 +165,22 @@ class GVNRemark(OptimizationRemark):
         self.clobbered_by: Optional[DetailItemWithLocation] = DetailItemWithLocation(details.get('ClobberedBy')) if 'ClobberedBy' in details else None
         self.other_access: Optional[DetailItemWithLocation] = DetailItemWithLocation(details.get('OtherAccess')) if 'OtherAccess' in details else None
         self.type: Optional[str] = details.get('Type')
+        
+    def to_llm_friendly_string(self) -> str:
+        """Convert GVN remark to LLM-friendly string format."""
+        base = super().to_llm_friendly_string()
+        
+        extra_info = []
+        if self.type:
+            extra_info.append(f"TYPE: {self.type}")
+        if self.clobbered_by and self.clobbered_by.type:
+            extra_info.append(f"CLOBBERED_BY: {self.clobbered_by.type}")
+        if self.other_access and self.other_access.type:
+            extra_info.append(f"OTHER_ACCESS: {self.other_access.type}")
+            
+        if extra_info:
+            return f"{base} | {' | '.join(extra_info)}"
+        return base
 
 
 class RegallocRemark(OptimizationRemark):
@@ -153,6 +196,24 @@ class RegallocRemark(OptimizationRemark):
         self.total_folded_reloads_cost: Optional[Union[int, float]] = details.get('TotalFoldedReloadsCost')
         self.num_remats: Optional[Union[int, float]] = details.get('NumRemats')
         self.total_remats_cost: Optional[Union[int, float]] = details.get('TotalRematsCost')
+        
+    def to_llm_friendly_string(self) -> str:
+        """Convert regalloc remark to LLM-friendly string format."""
+        base = super().to_llm_friendly_string()
+        
+        extra_info = []
+        if self.num_spills is not None:
+            extra_info.append(f"SPILLS: {self.num_spills} (COST: {self.total_spills_cost})")
+        if self.num_vr_copies is not None:
+            extra_info.append(f"VR_COPIES: {self.num_vr_copies} (COST: {self.total_copies_cost})")
+        if self.num_remats is not None:
+            extra_info.append(f"REMATS: {self.num_remats} (COST: {self.total_remats_cost})")
+        if self.num_folded_reloads is not None:
+            extra_info.append(f"FOLDED_RELOADS: {self.num_folded_reloads} (COST: {self.total_folded_reloads_cost})")
+            
+        if extra_info:
+            return f"{base} | {' | '.join(extra_info)}"
+        return base
 
 
 class LICMRemark(OptimizationRemark):
@@ -160,6 +221,8 @@ class LICMRemark(OptimizationRemark):
     # Currently no specific fields beyond base + Info
     def __init__(self, remark_dict: Dict[str, Any]):
         super().__init__(remark_dict)
+        
+    # Using the base class implementation of to_llm_friendly_string()
 
 
 class SLPvectorizeRemark(OptimizationRemark):
@@ -182,6 +245,20 @@ class SLPvectorizeRemark(OptimizationRemark):
             self.threshold = thresh_data.get('Value')
         elif thresh_data is not None:
             self.threshold = thresh_data
+            
+    def to_llm_friendly_string(self) -> str:
+        """Convert SLP vectorizer remark to LLM-friendly string format."""
+        base = super().to_llm_friendly_string()
+        
+        extra_info = []
+        if self.cost is not None:
+            extra_info.append(f"COST: {self.cost}")
+        if self.threshold is not None:
+            extra_info.append(f"THRESHOLD: {self.threshold}")
+            
+        if extra_info:
+            return f"{base} | {' | '.join(extra_info)}"
+        return base
 
 
 # --- Mapping from Pass Name to Class ---
@@ -288,6 +365,25 @@ def index_remarks_by_function(remarks: List[OptimizationRemark]) -> Dict[str, Li
         function_name = remark.function
         function_index[function_name].append(remark)
     return dict(function_index)
+
+def format_remarks_for_llm(remarks: List[OptimizationRemark]) -> str:
+    """
+    Format a list of optimization remarks into a string suitable for LLM prompts.
+    
+    Args:
+        remarks: A list of OptimizationRemark objects.
+        
+    Returns:
+        A formatted string containing all the remarks, ready for LLM consumption.
+    """
+    if not remarks:
+        return "No optimization remarks available."
+    
+    formatted_strings = []
+    for i, remark in enumerate(remarks, 1):
+        formatted_strings.append(f"REMARK #{i}: {remark.to_llm_friendly_string()}")
+    
+    return "\n".join(formatted_strings)
 
 # --- Example Usage ---
 if __name__ == "__main__":

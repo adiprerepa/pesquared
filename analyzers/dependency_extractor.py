@@ -191,11 +191,15 @@ def find_function_in_cursor(cursor, target_name):
     Recursively traverse the AST to find functions or methods whose spelling matches the target.
     Handles both standalone functions and class methods, including mangled names.
     """
+    # print(f"find_function_in_cursor({cursor}, {target_name})")
     matches = []
     # print(f"Checking cursor: {cursor.spelling} ({cursor.kind}), target: {target_name}")
     
     # With mangled names as default, we keep the target name as-is
     normalized_target = target_name
+    
+    # Check if target is a mangled name
+    is_target_mangled = is_mangled_name(target_name)
     
     # Get just the method name (after the last ::)
     method_name = target_name.split("::")[-1] if "::" in target_name else target_name
@@ -203,14 +207,24 @@ def find_function_in_cursor(cursor, target_name):
     
     # For backward compatibility, also check the base name without template params
     base_method_name = method_name.split("<")[0] if "<" in method_name else method_name
-    
+    # cursor_mangled_name = cursor.mangled_name if hasattr(cursor, 'mangled_name') else None
+    # print(f"cursor_mangled_name: {cursor_mangled_name}")
     # Handle class methods and standalone functions (including function templates)
     if cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD, cindex.CursorKind.FUNCTION_TEMPLATE):
         # Get fully qualified name for the function
         qualified_name = get_fully_qualified_name(cursor)
         
-        # Check for matches using mangled names
-        if (qualified_name == target_name or  # Exact match with qualified name (mangled)
+        # Get cursor's mangled name if available
+        cursor_mangled_name = cursor.mangled_name if hasattr(cursor, 'mangled_name') else None
+        # print(f"cursor_mangled_name: {cursor.__dict__}, qualified_name: {qualified_name}")
+        
+        # Direct mangled name check if target is mangled
+        if is_target_mangled and cursor_mangled_name and cursor_mangled_name == target_name:
+            matches.append(cursor)
+            return matches
+            
+        # Standard checks if not found by direct mangled name comparison
+        if (qualified_name == target_name or  # Exact match with qualified name
             ("::" not in target_name and cursor.spelling == method_name) or  # Match with just function name
             ("::" not in target_name and cursor.spelling == base_method_name)):  # Match with base method name (for compatibility)
             matches.append(cursor)
@@ -230,6 +244,14 @@ def find_function_in_cursor(cursor, target_name):
             
             # Search through class methods
             for child in cursor.get_children():
+                # Get child's mangled name if available
+                child_mangled_name = child.mangled_name if hasattr(child, 'mangled_name') else None
+                
+                # Direct mangled name check if target is mangled
+                if is_target_mangled and child_mangled_name and child_mangled_name == target_name:
+                    matches.append(child)
+                    continue
+                    
                 # Compare the method name (preserving mangling)
                 if child.kind == cindex.CursorKind.CXX_METHOD and (
                    child.spelling == method_name or
@@ -240,7 +262,7 @@ def find_function_in_cursor(cursor, target_name):
     elif cursor.kind == cindex.CursorKind.NAMESPACE:
         # print(f"Checking namespace: {cursor.spelling} (children names: {[c.spelling for c in cursor.get_children()]})")
         namespace_name = cursor.spelling
-        if target_name.startswith(f"{namespace_name}::"):
+        if not is_target_mangled and target_name.startswith(f"{namespace_name}::"):
             # This namespace might contain our target, prioritize searching its children
             for child in cursor.get_children():
                 matches.extend(find_function_in_cursor(child, target_name))
@@ -452,6 +474,7 @@ def parse_file(index, file_path, target_name):
     return functions, translation_unit
 
 def scan_codebase(codebase_dir, target_name):
+    # print(f"scanning codebase for {target_name}")
     index = cindex.Index.create()
     found_functions = []
     seen_locations = set()  # To track seen (file, line) pairs
@@ -576,7 +599,7 @@ def extract_dependencies(codebase_dir: str,
             # Keep the original mangled name for reference
             mangled_name = function_name
             # Use the demangled name for the search since Clang uses demangled names internally
-            function_name = demangled_name
+            function_name = function_name
             original_function_name = demangled_name
     
     normalized_function_name = normalize_template_name(original_function_name)

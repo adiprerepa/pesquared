@@ -83,7 +83,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
         # If max_depth is set, limit the call chain to the specified depth
         if max_depth is not None and len(call_chain) > max_depth:
             logger.info(f"⚠️ Call chain depth ({len(call_chain)}) exceeds max depth ({max_depth}), truncating...")
-            # Keep the leaf function and max_depth-1 ancestors (to make a total of max_depth functions)
+            # Keep the leaf function and max_deppidth-1 ancestors (to make a total of max_depth functions)
             call_chain = call_chain[-(max_depth):]
 
         if len(call_chain) > 1:
@@ -118,7 +118,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
                 remarks = perf_verifier.get_remarks()
                 demangled_fn = demangle_name(function_name)
                 index = index_remarks_by_function(remarks)
-                logger.info(f"index keys: {index.keys()}")
+                logger.debug(f"index keys: {index.keys()}")
                 if demangled_fn in index:
                     function_remarks = index[demangled_fn]
                     logger.info(f"found {len(function_remarks)} remarks for {demangled_fn}")
@@ -145,7 +145,7 @@ def optimize_hotspots(codebase_dir: str, stacks_dir: str, api_key: str, perf_ver
                     logger.debug(traceback.format_exc())
                     continue
 
-                logger.info(f"✨ Generated function: {result.optimized_function}")
+                logger.debug(f"✨ Generated function: {result.optimized_function}")
                 if result.original_function in result.optimized_function:
                     logger.info("🔄 Optimization did not change the function. Skipping...")
                     continue
