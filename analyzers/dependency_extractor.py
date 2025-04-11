@@ -18,6 +18,9 @@ def setup_clang():
     
     # Common paths for libclang on Linux
     possible_paths = [
+        "/usr/lib/llvm-18/lib",  # Ubuntu/Debian with LLVM 18
+        "/usr/lib/llvm-17/lib",  # Ubuntu/Debian with LLVM 17
+        "/usr/lib/llvm-16/lib",  # Ubuntu/Debian with LLVM 16
         "/usr/lib/llvm-15/lib",  # Ubuntu/Debian with LLVM 15
         "/usr/lib/llvm-14/lib",  # Ubuntu/Debian with LLVM 14
         "/usr/lib/llvm-13/lib",  # Ubuntu/Debian with LLVM 13
@@ -29,10 +32,11 @@ def setup_clang():
     # Try to find libclang
     for path in possible_paths:
         print(f"Checking {path}...")
-        if os.path.exists(os.path.join(path, "libclang.so")):
+        libclang_file = os.path.join(path, "libclang.so")
+        if os.path.exists(libclang_file):
             print(f"Found libclang.so in {path}")
             try:
-                cindex.Config.set_library_path(path)
+                cindex.Config.set_library_file(libclang_file)
                 cindex.Config.set_compatibility_check(False)
                 # Test if it works
                 index = cindex.Index.create()
@@ -42,6 +46,8 @@ def setup_clang():
             except Exception as e:
                 print(f"Error initializing clang with {path}: {str(e)}")
                 continue
+        else:
+            print(f"libclang.so not found in {path}")
     
     paths_checked = "\n".join(f"- {p}" for p in possible_paths)
     raise RuntimeError(

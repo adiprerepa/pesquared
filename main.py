@@ -327,9 +327,21 @@ def main():
     parser.add_argument('--model', default='gpt-3.5-turbo', help='LLM model to use for optimization (default: gpt-3.5-turbo)')
     parser.add_argument('--provider', default='openai', help='API provider to use for optimization (default: openai)')
     parser.add_argument('--temperature', type=float, default=0.7, help='Temperature for sampling from the model (default: 0.7)')
+    parser.add_argument('--obfuscate', type=bool, default=False, help='Obfuscate the code before sending to the model (default: False)')
     args = parser.parse_args()
 
-    codebase_dir = os.path.abspath(args.codebase_dir)
+    if args.codebase_dir.startswith('https://'):
+        print("🔗 Cloning codebase from URL...")
+        # dir is a git URL
+        # Clone the repo to a tmp/user/repo and set codebase_dir to that
+        from utils.git_utils import clone_repo
+        repo = clone_repo(args.codebase_dir)
+        codebase_dir = os.path.abspath(repo.working_tree_dir)
+        print(f"Cloned repo to {codebase_dir}")
+    else:
+        codebase_dir = os.path.abspath(args.codebase_dir)
+    if not os.path.exists(args.stacks_dir):
+        args.stacks_dir = os.path.join(codebase_dir, args.stacks_dir)
     setup_logger(args.debug, codebase_dir)
     logger = logging.getLogger()
 

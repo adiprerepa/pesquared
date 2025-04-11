@@ -1,9 +1,38 @@
-import os
 import logging
 import subprocess
 from contextlib import contextmanager
+import os, json, requests, git
 
 logger = logging.getLogger(__name__)
+
+def get_repo_size(owner, repo):
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        repo_info = response.json()
+        size_kb = repo_info.get('size', 0)
+        size_mb = size_kb / 1024
+        return size_mb
+    else:
+        print(f"Failed to fetch repository info: {response.status_code}")
+        return None
+
+def clone_repo(repo_url: str, max_size_mb=10**6):
+    pieces = repo_url.replace('.git', '').split('/')
+    repo_name = pieces[-1]
+    user_name = pieces[-2]
+    size_mb = get_repo_size(user_name, repo_name)
+    if size_mb is None or size_mb > max_size_mb:
+        print(f"Repository is too large: {size_mb} MB")
+        return None
+    local_repo_path = f'./tmp/{user_name}/{repo_name}'
+    if os.path.exists(local_repo_path):
+        return git.Repo(local_repo_path)
+    return git.Repo.clone_from(repo_url, local_repo_path, depth=1)
+
+def create_branch(repo, base_name, branch_name):
+    repo.git.checkout(base_name)
+    repo.git.checkout('-b', branch_name)
 
 def get_current_branch(codebase_dir='.'):
     """
