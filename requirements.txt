@@ -11,3 +11,6 @@ pyyaml
 cxxfilt
 networkx
 matplotlib
+scipy
+numpy
+python-jsonrpc-server
