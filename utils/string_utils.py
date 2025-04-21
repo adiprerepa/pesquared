@@ -2,6 +2,117 @@ import re, difflib
 from collections import defaultdict
 import numpy as np
 from functools import lru_cache
+import nltk
+nltk.download('words')
+
+from nltk.corpus import words
+
+word_list = list(words.words())  # A set of words from the NLTK corpus
+
+import random
+import re
+import hashlib
+
+def hash_identifier(name):
+    # Creates a short valid C++ identifier from a SHA-1 hash
+    return '_obf_' + hashlib.sha1(name.encode()).hexdigest()[:8]
+
+@lru_cache(maxsize=None)
+def legible_identifier(name):
+    return f'o_{random.choice(word_list)}'
+
+
+def obfuscate_cpp_code_with_map(code, identifier_function=hash_identifier, exclude_stdlib=True):
+    identifier_pattern = r'\b([a-zA-Z_][a-zA-Z_0-9]*)\b'
+
+    whitelist = {
+        'int', 'float', 'double', 'char', 'bool', 'void', 'class', 'struct',
+        'if', 'else', 'for', 'while', 'switch', 'case', 'return', 'break',
+        'continue', 'public', 'private', 'protected', 'const', 'static',
+        'inline', 'virtual', 'template', 'typename', 'using', 'namespace',
+        'include', 'new', 'delete', 'this', 'true', 'false', 'nullptr',
+        'operator', 'override', 'typedef', 'enum', 'sizeof', 'do', 'goto',
+        'extern', 'union', 'volatile', 'register', 'friend', 'explicit',
+        'try', 'catch', 'throw', 'noexcept', 'default', 'constexpr', 'inline'
+    }
+
+    if exclude_stdlib:
+        whitelist.update({
+            'std', 'cout', 'cin', 'string', 'vector', 'map', 'set', 'list',
+            'deque', 'unordered_map', 'unordered_set', 'algorithm', 'iostream',
+            'fstream', 'sstream', 'iomanip', 'cmath', 'cstdlib', 'cstring',
+            'ctime', 'cassert', 'cctype', 'climits'
+        })
+
+    identifiers = set(re.findall(identifier_pattern, code))
+    identifiers = {idf for idf in identifiers if idf not in whitelist}
+    # loop through the identifiers and build the obfuscation map
+    obfuscation_map = {}
+    for idf in identifiers:
+        # Check if the identifier is already in the obfuscation map
+        if idf not in obfuscation_map:
+            # Create a new identifier using the identifier function
+            new_idf = identifier_function(idf)
+            # Ensure the new identifier is unique
+            while new_idf in obfuscation_map.values() or new_idf in whitelist:
+                new_idf = identifier_function(idf)
+            obfuscation_map[idf] = new_idf
+    sorted_identifiers = sorted(obfuscation_map.keys(), key=len, reverse=True)
+
+    for idf in sorted_identifiers:
+        code = re.sub(r'\b{}\b'.format(re.escape(idf)), obfuscation_map[idf], code)
+
+    return code, obfuscation_map
+
+
+def deobfuscate_cpp_code(obfuscated_code, obfuscation_map):
+    reverse_map = {v: k for k, v in obfuscation_map.items()}
+    sorted_keys = sorted(reverse_map.keys(), key=len, reverse=True)
+
+    for obf in sorted_keys:
+        obfuscated_code = re.sub(r'\b{}\b'.format(re.escape(obf)), reverse_map[obf], obfuscated_code)
+
+    return obfuscated_code
+
+def remove_comments(code: str) -> str:
+    """
+    Remove all C++-style (//...) and C-style (/*...*/) comments from `code`,
+    while preserving string and character literals.
+
+    Parameters
+    ----------
+    code : str
+        The input C/C++ source as a single string.
+
+    Returns
+    -------
+    str
+        The source with all comments removed.
+    """
+    # This regex alternates between:
+    # 1. A double-quoted string:    "([^"\\]|\\.)*"
+    # 2. A single-quoted string:    '([^'\\]|\\.)*'
+    # 3. A C-style comment:         /\*.*?\*/
+    # 4. A C++-style comment:       //.*?$
+    pattern = re.compile(
+        r'''
+        ("([^"\\]|\\.)*")     # group 1: double-quoted string
+      | ('([^'\\]|\\.)*')     # group 3: single-quoted string
+      | (/\*.*?\*/)           # group 5: C-style comment
+      | (//[^\r\n]*$)         # group 6: C++-style comment
+        ''',
+        re.MULTILINE | re.DOTALL | re.VERBOSE
+    )
+
+    def _replacer(match: re.Match[str]) -> str:
+        # If group 1 or 3 matched, it's a string literal—keep it
+        if match.group(1) or match.group(3):
+            return match.group(0)
+        # Otherwise it's a comment (group 5 or 6)—remove it
+        return ""
+
+    return pattern.sub(_replacer, code)
+
 
 def arr_from_sep_string(string: str, sep=','):
     return [x.strip() for x in string.split(sep)]

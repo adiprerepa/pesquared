@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, Union, List
 from analyzers.dependency_extractor import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
 from utils import git_utils
 from analyzers.clang_remark_analyzer import OptimizationRemark
+from utils.string_utils import obfuscate_cpp_code_with_map, deobfuscate_cpp_code
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +210,8 @@ Please fix these errors in your new implementation while maintaining optimizatio
                          temperature=0.7,
                          call_chain: list = None,
                          position_in_chain: int = None,
-                         function_remarks: List[OptimizationRemark]=[]) -> OptimizationResult:
+                         function_remarks: List[OptimizationRemark]=[],
+                         obfuscate: bool = False) -> OptimizationResult:
         """
         Optimize a function using LLM and create a git branch with the changes.
         
@@ -335,11 +337,22 @@ Please fix these errors in your new implementation while maintaining optimizatio
             # Determine if this is a parent function in a call chain and which child functions it calls
             is_parent_in_chain = False
             child_functions = None
+            obfuscation_map = {}
             
             if call_chain and position_in_chain is not None and position_in_chain < len(call_chain) - 1:
                 is_parent_in_chain = True
                 # Get all child functions in the call chain that come after this function
                 child_functions = call_chain[position_in_chain + 1:]
+
+            if obfuscate:
+                big_function = '\n//===//\n'.join([original_function] + child_functions)
+                # Obfuscate the original function and create a mapping
+                obfuscated_function, obfuscation_map = obfuscate_cpp_code_with_map(big_function)
+                big_function = obfuscated_function
+                # Split back into original and child functions
+                split_functions = big_function.split('\n//===//\n')
+                original_function = split_functions[0]
+                child_functions = split_functions[1:]
             
             # Create optimization prompt, with error context if this is a retry
             if compilation_error and previous_result:
@@ -407,7 +420,7 @@ Please fix these errors in your new implementation while maintaining optimizatio
             
             return OptimizationResult(
                 original_function=original_function.strip(),
-                optimized_function=result['function'].strip(),
+                optimized_function=result['function'].strip() if not obfuscate else deobfuscate_cpp_code(result['function'].strip(), obfuscation_map),
                 optimization_summary=result['explanation'].strip(),
                 branch_name=branch_name,
                 file_path=original_file
