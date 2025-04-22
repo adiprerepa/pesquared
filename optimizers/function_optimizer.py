@@ -10,7 +10,6 @@ from typing import Optional, Dict, Any, Union, List
 from analyzers.dependency_extractor import extract_dependencies, DependencyExtractorConfig, format_analysis_output, DependencyAnalysis
 from utils import git_utils
 from analyzers.clang_remark_analyzer import OptimizationRemark
-from utils.string_utils import obfuscate_cpp_code_with_map, deobfuscate_cpp_code
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +88,9 @@ class FunctionOptimizer:
                                   compilation_error: str = None,
                                   original_function: str = None,
                                   is_parent_in_chain: bool = False,
-                                  child_functions: list = None) -> str:
+                                  child_functions: list = None,
+                                  remarks_str: str = None,
+                                  original_location: str = None) -> str:
         """
         Create the prompt for the LLM optimization.
         
@@ -100,6 +101,8 @@ class FunctionOptimizer:
             original_function: Original unmodified function for re-attempts
             is_parent_in_chain: Whether this function is a parent in a call chain
             child_functions: List of child function names in the call chain
+            remarks_str: Formatted string containing compiler optimization remarks
+            original_location: File path and line number of the function
         """
         base_prompt = f"""You are an expert C++ performance optimization engineer tasked with optimizing a function for better performance.
 
@@ -134,7 +137,17 @@ The provided analysis includes:
 - All dependent type definitions
 - All function calls made
 - Complete usage context
+"""
 
+        # Add compiler optimization remarks if available
+        if remarks_str:
+            base_prompt += f"""
+COMPILER OPTIMIZATION REMARKS:
+These are compiler remarks about why optimization opportunities were missed:
+{remarks_str}
+"""
+
+        base_prompt += f"""
 Format your response exactly as:
 OPTIMIZATION_SUMMARY: <brief git-branch-friendly description>
 EXPLANATION: <concise explanation of optimizations>
@@ -142,6 +155,7 @@ OPTIMIZED_FUNCTION:
 <optimized code - no formatting, just the raw function code, no explanation after, surround with ```>
 
 Function to optimize: {function_name}
+Location: {original_location if original_location else "Unknown"}
 
 Analysis:
 {analysis_output}
@@ -210,8 +224,7 @@ Please fix these errors in your new implementation while maintaining optimizatio
                          temperature=0.7,
                          call_chain: list = None,
                          position_in_chain: int = None,
-                         function_remarks: List[OptimizationRemark]=[],
-                         obfuscate: bool = False) -> OptimizationResult:
+                         function_remarks: List[OptimizationRemark] = None) -> OptimizationResult:
         """
         Optimize a function using LLM and create a git branch with the changes.
         
@@ -295,41 +308,56 @@ Please fix these errors in your new implementation while maintaining optimizatio
                 sanitized_func_name = sanitize_function_name(func_name)
                 logger.debug(f"sanitized_func_name: {sanitized_func_name}, sanitized_target: {sanitized_target}, func: {func}")
                 
+                # Direct mangled name comparison first if applicable
+                if is_mangled_name(function_name) and is_mangled_name(func['name']):
+                    if func['name'] == function_name:
+                        logger.debug(f"Found exact mangled name match: {func['name']}")
+                        original_location = func['location'] # Keep the full location with line number
+                        original_file = func['location'].split(':')[0]
+                        original_function = func['body']
+                        break
+                
                 # More liberal match - check if one is contained in the other or vice versa
                 if (sanitized_func_name == sanitized_target or 
                     sanitized_func_name in sanitized_target or 
                     sanitized_target in sanitized_func_name):
-                    f = func['location'].split(':')[0]
+                    file_path = func['location'].split(':')[0]
                     # Prioritize implementation files (.cpp, .cc, .cxx)
-                    if f.endswith(('.cpp', '.cc', '.cxx')):
-                        cpp_file = f
+                    if file_path.endswith(('.cpp', '.cc', '.cxx')):
+                        cpp_file = file_path
                         cpp_function = func['body']
+                        cpp_location = func['location']
                         logger.debug(f"cpp_file: {cpp_file}, cpp_function: {cpp_function}")
                         # If we find an implementation file with function body, use it immediately
                         if cpp_function and len(cpp_function.strip()) > 0 and '{' in cpp_function:
                             original_file = cpp_file
                             original_function = cpp_function
+                            original_location = cpp_location
                             break
                     # Otherwise capture header files (.h, .hpp, .hxx)
-                    elif f.endswith(('.h', '.hpp', '.hxx')):
-                        header_file = f
+                    elif file_path.endswith(('.h', '.hpp', '.hxx')):
+                        header_file = file_path
                         header_function = func['body']
+                        header_location = func['location']
                         # If we find a header with function body and not just declaration
                         if header_function and len(header_function.strip()) > 0 and '{' in header_function:
                             # Store but continue looking for cpp implementation
                             if not original_file:
                                 original_file = header_file
                                 original_function = header_function
+                                original_location = header_location
             
             # If we couldn't find any implementation, but have a cpp location, use it
             if (not original_file or not original_function) and cpp_file:
                 original_file = cpp_file
                 original_function = cpp_function
+                original_location = cpp_location if 'cpp_location' in locals() else cpp_file
             
             # If we still couldn't find any implementation, but have a header with body, use it
             if (not original_file or not original_function) and header_file:
                 original_file = header_file
                 original_function = header_function
+                original_location = header_location if 'header_location' in locals() else header_file
             
             if not original_file or not original_function:
                 raise ValueError(f"Could not locate original function: {function_name}")
@@ -337,41 +365,58 @@ Please fix these errors in your new implementation while maintaining optimizatio
             # Determine if this is a parent function in a call chain and which child functions it calls
             is_parent_in_chain = False
             child_functions = None
-            obfuscation_map = {}
             
             if call_chain and position_in_chain is not None and position_in_chain < len(call_chain) - 1:
                 is_parent_in_chain = True
                 # Get all child functions in the call chain that come after this function
                 child_functions = call_chain[position_in_chain + 1:]
-
-            if obfuscate:
-                big_function = '\n//===//\n'.join([original_function] + child_functions)
-                # Obfuscate the original function and create a mapping
-                obfuscated_function, obfuscation_map = obfuscate_cpp_code_with_map(big_function)
-                big_function = obfuscated_function
-                # Split back into original and child functions
-                split_functions = big_function.split('\n//===//\n')
-                original_function = split_functions[0]
-                child_functions = split_functions[1:]
             
             # Create optimization prompt, with error context if this is a retry
             if compilation_error and previous_result:
+                # Process function remarks if available
+                remarks_str = None
+                if function_remarks and len(function_remarks) > 0:
+                    # Import the format_remarks_for_llm function
+                    from analyzers.clang_remark_analyzer import format_remarks_for_llm
+                    remarks_str = format_remarks_for_llm(function_remarks)
+                    # logger.info(f"Remarks: {remarks_str}")
+                    logger.debug(f"Added {len(function_remarks)} remarks to the prompt")
+                
+                # Use original_location if available, otherwise just use file path
+                location_for_prompt = original_location if 'original_location' in locals() else original_file
+                    
                 prompt = self._create_optimization_prompt(
                     function_name, 
                     analysis_output,
                     compilation_error,
                     previous_result.original_function,
                     is_parent_in_chain,
-                    child_functions
+                    child_functions,
+                    remarks_str,
+                    location_for_prompt
                 )
             else:
+                # Process function remarks if available
+                remarks_str = None
+                if function_remarks and len(function_remarks) > 0:
+                    # Import the format_remarks_for_lm function
+                    from analyzers.clang_remark_analyzer import format_remarks_for_llm
+                    remarks_str = format_remarks_for_llm(function_remarks)
+                    logger.debug(f"Added {len(function_remarks)} remarks to the prompt")
+                
+                # Use original_location if available, otherwise just use file path
+                location_for_prompt = original_location if 'original_location' in locals() else original_file
+                    
                 prompt = self._create_optimization_prompt(
                     function_name, 
                     analysis_output,
                     is_parent_in_chain=is_parent_in_chain,
-                    child_functions=child_functions
+                    child_functions=child_functions,
+                    remarks_str=remarks_str,
+                    original_location=location_for_prompt
                 )
-            
+                logger.debug(f"prompt: {prompt}")
+
             # Get optimization from LLM based on the selected provider
             if self.provider == "openai":
                 response = self.client.chat.completions.create(
@@ -420,7 +465,7 @@ Please fix these errors in your new implementation while maintaining optimizatio
             
             return OptimizationResult(
                 original_function=original_function.strip(),
-                optimized_function=result['function'].strip() if not obfuscate else deobfuscate_cpp_code(result['function'].strip(), obfuscation_map),
+                optimized_function=result['function'].strip(),
                 optimization_summary=result['explanation'].strip(),
                 branch_name=branch_name,
                 file_path=original_file
