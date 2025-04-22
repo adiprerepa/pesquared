@@ -18,6 +18,7 @@ def setup_clang():
     
     # Common paths for libclang on Linux
     possible_paths = [
+        "/usr/lib/llvm-18/lib",
         "/usr/lib/llvm-15/lib",  # Ubuntu/Debian with LLVM 15
         "/usr/lib/llvm-14/lib",  # Ubuntu/Debian with LLVM 14
         "/usr/lib/llvm-13/lib",  # Ubuntu/Debian with LLVM 13
