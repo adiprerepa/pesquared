@@ -2,6 +2,8 @@ import logging
 import subprocess
 from contextlib import contextmanager
 import os, json, requests, git
+import shutil
+from git import Repo, GitCommandError
 
 logger = logging.getLogger(__name__)
 
@@ -17,18 +19,57 @@ def get_repo_size(owner, repo):
         print(f"Failed to fetch repository info: {response.status_code}")
         return None
 
-def clone_repo(repo_url: str, max_size_mb=10**6):
+def clone_repo(repo_url: str, branch: str = 'main', max_size_mb=10**6):
     pieces = repo_url.replace('.git', '').split('/')
     repo_name = pieces[-1]
     user_name = pieces[-2]
     size_mb = get_repo_size(user_name, repo_name)
+
     if size_mb is None or size_mb > max_size_mb:
         print(f"Repository is too large: {size_mb} MB")
         return None
+
     local_repo_path = f'./tmp/{user_name}/{repo_name}'
+
+    # If repo exists locally
     if os.path.exists(local_repo_path):
-        return git.Repo(local_repo_path)
-    return git.Repo.clone_from(repo_url, local_repo_path, depth=1)
+        try:
+            repo = Repo(local_repo_path)
+            current_branch = repo.active_branch.name
+
+            if current_branch != branch:
+                print(f"Switching from {current_branch} to {branch}...")
+                # Fetch all branches
+                repo.remotes.origin.fetch()
+
+                # Try to checkout the branch
+                try:
+                    repo.git.checkout(branch)
+                except GitCommandError:
+                    print(f"Branch {branch} not found locally or remotely. Re-cloning.")
+                    shutil.rmtree(local_repo_path)
+                    return Repo.clone_from(
+                        repo_url,
+                        local_repo_path,
+                        branch=branch,
+                        depth=1,
+                        single_branch=True
+                    )
+            return repo
+        except Exception as e:
+            print(f"Error opening existing repo: {e}. Re-cloning.")
+            shutil.rmtree(local_repo_path)
+
+    # Fresh shallow clone
+    return Repo.clone_from(
+        repo_url,
+        local_repo_path,
+        branch=branch,
+        depth=1,
+        single_branch=True
+    )
+
+
 
 def create_branch(repo, base_name, branch_name):
     repo.git.checkout(base_name)

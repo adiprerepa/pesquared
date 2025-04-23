@@ -4,4 +4,4 @@ venv/
 .env
 .idea/
 .vscode/
-
+tmp/
