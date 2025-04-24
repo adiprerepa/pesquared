@@ -11,36 +11,35 @@ from utils.cursor_utils import loc_info, CTOR_KINDS, FUNC_KINDS, TYPE_KINDS, TEM
 
 _CLANG_INITIALIZED = False
 
-from enum import IntFlag, auto
+from enum import IntFlag
 
 class NodeKind(IntFlag):
-    # Base categories - use explicit bit positions
+    # Base categories
     UNKNOWN = 0
-    FUNCTION = 1 << 0  # 1
-    VARIABLE = 1 << 1  # 2
-    TYPE = 1 << 2      # 4
-    
-    # Function subcategories
-    CONSTRUCTOR = FUNCTION | (1 << 3)    # 1 + 8 = 9
-    DESTRUCTOR = FUNCTION | (1 << 4)     # 1 + 16 = 17
-    METHOD = FUNCTION | (1 << 5)         # 1 + 32 = 33
-    FREE_FUNCTION = FUNCTION | (1 << 6)  # 1 + 64 = 65
-    
-    # Variable subcategories
-    MEMBER_VAR = VARIABLE | (1 << 7)    # 2 + 128 = 130
-    GLOBAL_VAR = VARIABLE | (1 << 8)    # 2 + 256 = 258
-    LOCAL_VAR = VARIABLE | (1 << 9)     # 2 + 512 = 514
-    
-    # Type subcategories
-    CLASS = TYPE | (1 << 10)      # 4 + 1024 = 1028
-    STRUCT = TYPE | (1 << 11)     # 4 + 2048 = 2052
-    ENUM = TYPE | (1 << 12)       # 4 + 4096 = 4100
-    TYPEDEF = TYPE | (1 << 13)    # 4 + 8192 = 8196
-    TEMPLATE = TYPE | (1 << 14)   # 4 + 16384 = 16388
-    
-    # Origin modifiers - use high bits
-    IN_CODEBASE = 1 << 24  # 16,777,216
-    LIBRARY = 1 << 25      # 33,554,432
+    FUNCTION = 1 << 0
+    VARIABLE = 1 << 1
+    TYPE = 1 << 2
+
+    # Subcategories embed their base bit
+    CONSTRUCTOR = FUNCTION | (1 << 3)
+    DESTRUCTOR = FUNCTION | (1 << 4)
+    METHOD = FUNCTION | (1 << 5)
+    FREE_FUNCTION = FUNCTION | (1 << 6)
+
+    MEMBER_VAR = VARIABLE | (1 << 7)
+    GLOBAL_VAR = VARIABLE | (1 << 8)
+    LOCAL_VAR = VARIABLE | (1 << 9)
+
+    CLASS = TYPE | (1 << 10)
+    STRUCT = TYPE | (1 << 11)
+    ENUM = TYPE | (1 << 12)
+    TYPEDEF = TYPE | (1 << 13)
+    TEMPLATE = TYPE | (1 << 14)
+
+    # Origin modifiers
+    IN_CODEBASE = 1 << 24
+    LIBRARY = 1 << 25
+
 
 class EdgeType(IntFlag):
     # Base categories
@@ -65,6 +64,9 @@ class EdgeType(IntFlag):
     # Additional properties
     DIRECT = 1 << 24    # Direct reference in source
     INDIRECT = 1 << 25  # Indirect reference (e.g., via typedef)
+
+def is_kind(node, kind):
+    return (node & kind) == kind
 
 class CodeAnalyzer:
     def __init__(self, repo_path: Path):
@@ -262,7 +264,7 @@ class CodeAnalyzer:
                     node_kind |= NodeKind.CONSTRUCTOR
             else:
                 fq = self.fq_name(cursor)
-                node_kind |= NodeKind.FUNCTION
+                node_kind |= NodeKind.METHOD if '::' in fq else NodeKind.FREE_FUNCTION
             node_kind |= NodeKind.IN_CODEBASE if in_proj(cursor) else NodeKind.LIBRARY
             ensure_node(fq, node_kind, cursor)
             # else:
@@ -276,19 +278,22 @@ class CodeAnalyzer:
         # --- member variables ---
         elif cursor.kind in MEMBER_KINDS and in_proj(cursor):
             fq = self.fq_name(cursor)
-            node_kind = NodeKind.MEMBER_VAR
+            node_kind |= NodeKind.MEMBER_VAR
+            node_kind |= NodeKind.IN_CODEBASE if in_proj(cursor) else NodeKind.LIBRARY
             ensure_node(fq, node_kind, cursor)
 
         # --- global variables ---
         elif cursor.kind in GLOBAL_KINDS and cursor.semantic_parent.kind == cindex.CursorKind.TRANSLATION_UNIT and in_proj(cursor):
             fq = self.fq_name(cursor)
             node_kind = NodeKind.GLOBAL_VAR
+            node_kind |= NodeKind.IN_CODEBASE if in_proj(cursor) else NodeKind.LIBRARY
             ensure_node(fq, node_kind, cursor)
 
         # --- types ---
         elif cursor.kind in TYPE_KINDS and in_proj(cursor):
             fq = self.fq_name(cursor)
             node_kind = NodeKind.TYPE
+            node_kind |= NodeKind.IN_CODEBASE if in_proj(cursor) else NodeKind.LIBRARY
             ensure_node(fq, node_kind, cursor)
 
         # recurse
@@ -310,23 +315,20 @@ class CodeAnalyzer:
 
 
     def collect_edges(self, cursor: cindex.Cursor, ctx_func: Optional[str]) -> None:
-        def in_proj(c: cindex.Cursor) -> bool:
-            return bool(c.location.file) and Path(c.location.file.name).resolve().is_relative_to(self.repo_path)
-
         # Update context if we're inside a known function or template
-        if cursor.kind in FUNC_KINDS and cursor.is_definition() and in_proj(cursor):
+        if cursor.kind in FUNC_KINDS and cursor.is_definition():
             if cursor.kind in CTOR_KINDS:
                 ctx_func = self._signature(cursor)
             else:
                 ctx_func = self.fq_name(cursor)
 
-        if cursor.kind in TYPE_KINDS and cursor.is_definition() and in_proj(cursor):
+        if cursor.kind in TYPE_KINDS and cursor.is_definition():
             ctx_func = self.fq_name(cursor)
         
-        if cursor.kind in MEMBER_KINDS and cursor.is_definition() and in_proj(cursor):
+        if cursor.kind in MEMBER_KINDS and cursor.is_definition():
             ctx_func = self.fq_name(cursor)
 
-        if cursor.kind in GLOBAL_KINDS and cursor.is_definition() and cursor.semantic_parent.kind == cindex.CursorKind.TRANSLATION_UNIT and in_proj(cursor):
+        if cursor.kind in GLOBAL_KINDS and cursor.is_definition() and cursor.semantic_parent.kind == cindex.CursorKind.TRANSLATION_UNIT:
             ctx_func = self.fq_name(cursor)
 
         # --- Function call detection
@@ -348,10 +350,10 @@ class CodeAnalyzer:
                     if (
                         child.kind == cindex.CursorKind.DECL_REF_EXPR and
                         child.spelling and
-                        (not child.referenced or child.referenced.kind in self.FUNC_KINDS)
+                        (not child.referenced or child.referenced.kind in FUNC_KINDS)
                     ):
                         raw_spelling = child.spelling
-                        if child.referenced and child.referenced.kind in self.FUNC_KINDS:
+                        if child.referenced and child.referenced.kind in FUNC_KINDS:
                             callee_name = self.fq_name(child.referenced)
                         else:
                             variants = self.base_name_variants(child.spelling)
@@ -378,7 +380,7 @@ class CodeAnalyzer:
         # --- references ---
         if cursor.kind == cindex.CursorKind.DECL_REF_EXPR and ctx_func:
             ref = cursor.referenced
-            if ref and in_proj(ref):
+            if ref:
                 loc = cursor.location
                 if ref.kind in FUNC_KINDS:
                     # function ref edge
@@ -398,7 +400,7 @@ class CodeAnalyzer:
                                             raw=cursor.spelling)
         if cursor.kind == cindex.CursorKind.MEMBER_REF_EXPR and ctx_func:
                 ref = cursor.referenced
-                if ref and in_proj(ref):
+                if ref:
                     loc = cursor.location
                     name = self.fq_name(ref)
                     self.add_edge_strict(ctx_func, name, 
@@ -407,7 +409,7 @@ class CodeAnalyzer:
                                         raw=cursor.spelling)
         if cursor.kind == cindex.CursorKind.NAMESPACE_REF and ctx_func:
             ref = cursor.referenced
-            if ref and in_proj(ref):
+            if ref:
                 loc = cursor.location
                 name = self.fq_name(ref)
                 self.add_edge_strict(ctx_func, name, 
@@ -417,19 +419,17 @@ class CodeAnalyzer:
 
 
         # --- Type reference tracking
-        if cursor.kind == cindex.CursorKind.TYPE_REF and ctx_func and in_proj(cursor):
+        if cursor.kind == cindex.CursorKind.TYPE_REF and ctx_func:
             decl = cursor.referenced or cursor.get_definition() or cursor.get_type().get_declaration()
             if not decl:
                 return
             if decl.kind in TEMPLATE_PARAM_KINDS:
-                print(f"⚠️ Ignoring template parameter reference: {decl.spelling} at location {loc_info(decl)}")
                 return
 
-            if in_proj(decl):
-                type_name = self.fq_name(decl)
-                loc = cursor.location
-                if type_name != ctx_func:
-                    self.add_edge_strict(ctx_func, type_name, edge_type=EdgeType.TYPE_REF, location=(str(loc.file), loc.line), raw=cursor.spelling)
+            type_name = self.fq_name(decl)
+            loc = cursor.location
+            if type_name != ctx_func:
+                self.add_edge_strict(ctx_func, type_name, edge_type=EdgeType.TYPE_REF, location=(str(loc.file), loc.line), raw=cursor.spelling)
 
         # Recurse into children
         for child in cursor.get_children():
@@ -504,7 +504,27 @@ class CodeAnalyzer:
     def cpp_files(self) -> List[Path]:
         return [Path(dp) / f for dp, _, files in os.walk(self.repo_path) for f in files if f.endswith((".cpp", ".cc", ".cxx", ".c", ".hpp", ".h"))]
 
-    # ──────────────────── Build graph ─────────────────────────────────-
+    # ──────────────────── Build graph ─────────────────────────────────
+
+    def _close_graph(self) -> None:
+        # if we have 2 nodes `name` and `name::name`, merge into `name::name`
+        for n in list(self.graph.nodes):
+            if "::" in n:
+                split = n.split("::")
+                # Check if all elements of split are the same
+                if len(set(split)) == 1:
+                    base = split[-1]
+                    if base in self.graph.nodes:
+                        print(f"Merging node {base} into {n}")
+                        self.graph = nx.contracted_nodes(self.graph, n, base, self_loops=False)
+        # make all types who point to variables, point to the variables' succesors
+        for n in list(self.graph.nodes):
+            if self.graph.nodes[n]["kind"] & NodeKind.TYPE:
+                for succ in list(self.graph.successors(n)):
+                    if is_kind(self.graph.nodes[succ]["kind"], NodeKind.VARIABLE):
+                        for succ_succ in list(self.graph.successors(succ)):
+                            print(f"Adding edge from {n} to {succ_succ}")
+                            self.add_edge_strict(n, succ_succ, edge_type=EdgeType.DEPENDENCY)
 
     def _build_graph(self) -> nx.DiGraph:
         self.graph = nx.DiGraph()    
@@ -523,15 +543,7 @@ class CodeAnalyzer:
         except Exception as e:
             print(f"❌ Failed to remove uber file: {e}")
         # if we have 2 nodes `name` and `name::name`, merge into `name::name`
-        for n in list(self.graph.nodes):
-            if "::" in n:
-                split = n.split("::")
-                # Check if all elements of split are the same
-                if len(set(split)) == 1:
-                    base = split[-1]
-                    if base in self.graph.nodes:
-                        print(f"Merging node {base} into {n}")
-                        self.graph = nx.contracted_nodes(self.graph, n, base, self_loops=False)
+        self._close_graph()
     
     def induce_subgraph(
         self,
@@ -572,22 +584,8 @@ class CodeAnalyzer:
     
         return induced_graph
 
-    def plot(self, horizontal=False, exclude_node_kinds=None, exclude_edge_types=None):
-        exclude_node_kinds = exclude_node_kinds or set()
-        exclude_edge_types = exclude_edge_types or set()
-
-        # Filter nodes and edges
-        filtered_nodes = [
-            node for node in self.graph.nodes
-            if not any(self.graph.nodes[node].get("kind", NodeKind.UNKNOWN) & kind for kind in exclude_node_kinds)
-        ]
-        filtered_graph = self.graph.subgraph(filtered_nodes).copy()
-
-        edges_to_remove = [
-            (u, v) for u, v in filtered_graph.edges
-            if any(filtered_graph.edges[u, v].get("type", EdgeType.UNKNOWN) & edge_type for edge_type in exclude_edge_types)
-        ]
-        filtered_graph.remove_edges_from(edges_to_remove)
+    def plot(self, horizontal=False, node_filter: Optional[callable] = None, edge_filter: Optional[callable] = None):
+        filtered_graph = self.induce_subgraph(node_filter, edge_filter)
 
         # --- Level Computation ---
         levels = {}
