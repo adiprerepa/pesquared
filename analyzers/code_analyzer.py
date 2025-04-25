@@ -74,25 +74,25 @@ class EdgeType(IntFlag):
 def is_kind(node, kind):
     return (node & kind) == kind
 
-class CodeAnalyzer:
-    lib_subgraph : Optional[nx.DiGraph] = None
-    def __init__(self, repo_path: Path):
-        self.repo_path = Path(repo_path).resolve()
-        self.graph = nx.DiGraph()
-        self._file_cache: Dict[str, List[str]] = {}
-        self._init_clang()
-        self.index = cindex.Index.create()
-        self.branch = get_current_branch(self.repo_path)
-        self._build_graph()
+class CodeAnalyzer(nx.DiGraph):
+    # def __init__(self, repo_path: Path):
+    #     self.repo_path = Path(repo_path).resolve()
+    #     self._file_cache: Dict[str, List[str]] = {}
+    #     self._init_clang()
+    #     self.index = cindex.Index.create()
+    #     self.branch = get_current_branch(self.repo_path)
+    #     self.lib_subgraph : Optional[nx.DiGraph] = None
+    #     self._build_graph()
     
     def __init__(self, url: str, branch: str):
+        super().__init__()
         repo = clone_repo(url, branch)
         self.repo_path = Path(repo.working_dir).resolve()
-        self.graph = nx.DiGraph()
         self._file_cache: Dict[str, List[str]] = {}
         self._init_clang()
         self.index = cindex.Index.create()
         self.branch = get_current_branch(self.repo_path)
+        self.lib_subgraph : Optional[nx.DiGraph] = None
         self._build_graph()
         
 
@@ -280,7 +280,7 @@ class CodeAnalyzer:
         """Add a node to the graph."""
         # Check if node doesn't exist or if new AST is more detailed
         ast_outline = "\n".join(self.outline_ast(cursor)) if cursor else ""
-        if name not in self.graph or len(self.graph.nodes[name].get('ast', '')) < len(ast_outline):
+        if name not in self or len(self.nodes[name].get('ast', '')) < len(ast_outline):
             # Basic node properties
             attrs = {"kind": kind, "code": "", "ast": "", "cursor": None}
 
@@ -291,7 +291,7 @@ class CodeAnalyzer:
                 attrs["ast"] = ast_outline
                 attrs["cursor"] = cursor
 
-            self.graph.add_node(name, **attrs)
+            self.add_node(name, **attrs)
 
     def determine_node_kind(self, cur: cindex.Cursor) -> tuple[NodeKind, str]:
         """Determine the node kind and fully qualified name for a cursor."""
@@ -331,15 +331,15 @@ class CodeAnalyzer:
     def add_edge_strict(self, u: str, v: str, edge_type: EdgeType = EdgeType.UNKNOWN, **kwargs) -> None:
         if u == v:
             return
-        if self.graph.has_edge(u, v):
+        if self.has_edge(u, v):
             # If edge exists, update the edge type by combining with any existing type
-            current_type = self.graph.edges[u, v].get("type", EdgeType.UNKNOWN)
-            self.graph.edges[u, v]["type"] = current_type | edge_type
+            current_type = self.edges[u, v].get("type", EdgeType.UNKNOWN)
+            self.edges[u, v]["type"] = current_type | edge_type
             return
-        if not self.graph.has_node(u) or not self.graph.has_node(v):
+        if not self.has_node(u) or not self.has_node(v):
             return
         else:
-            self.graph.add_edge(u, v, type=edge_type, **kwargs)
+            self.add_edge(u, v, type=edge_type, **kwargs)
 
 
     def collect_edges(self, cursor: cindex.Cursor, ctx_func: Optional[str]) -> None:
@@ -418,7 +418,7 @@ class CodeAnalyzer:
                 # Try to resolve by name
                 variants = self.base_name_variants(child.spelling)
                 matches = [
-                    n for n, d in self.graph.nodes(data=True)
+                    n for n, d in self.nodes(data=True)
                     if d.get("kind") & NodeKind.FUNCTION and variants & self.base_name_variants(n)
                 ]
                 
@@ -591,26 +591,77 @@ class CodeAnalyzer:
         return [Path(dp) / f for dp, _, files in os.walk(self.repo_path) for f in files if f.endswith((".cpp", ".cc", ".cxx", ".c", ".hpp", ".h"))]
 
     # ──────────────────── Build graph ─────────────────────────────────
+    def _base_function_name(self, full_name: str) -> str:
+        return full_name.split("::")[-1].split('(')[0]
+
 
     def _close_graph(self) -> None:
         # if we have 2 nodes `name` and `name::name`, merge into `name::name`
-        for n in list(self.graph.nodes):
+        for n in list(self.nodes):
             if "::" in n:
                 split = n.split("::")
                 # Check if all elements of split are the same
                 if len(set(split)) == 1:
                     base = split[-1]
-                    if base in self.graph.nodes:
+                    if base in self.nodes:
                         print(f"Merging node {base} into {n}")
-                        self.graph = nx.contracted_nodes(self.graph, n, base, self_loops=False)
+                        contracted = nx.contracted_nodes(nx.DiGraph(self), n, base, self_loops=False)
+                        self.clear()
+                        self.add_nodes_from(contracted.nodes(data=True))
+                        self.add_edges_from(contracted.edges(data=True))
         # make all types who point to variables, point to the variables' succesors
-        for n in list(self.graph.nodes):
-            if self.graph.nodes[n]["kind"] & NodeKind.TYPE:
-                for succ in list(self.graph.successors(n)):
-                    if is_kind(self.graph.nodes[succ]["kind"], NodeKind.VARIABLE):
-                        for succ_succ in list(self.graph.successors(succ)):
+        for n in list(self.nodes):
+            if self.nodes[n]["kind"] & NodeKind.TYPE:
+                for succ in list(self.successors(n)):
+                    if is_kind(self.nodes[succ]["kind"], NodeKind.VARIABLE):
+                        for succ_succ in list(self.successors(succ)):
                             print(f"Adding edge from {n} to {succ_succ}")
                             self.add_edge_strict(n, succ_succ, edge_type=EdgeType.DEPENDENCY)
+        
+        poly_graph = nx.DiGraph()
+        for node, attrs in self.nodes(data=True):
+            if not is_kind(attrs.get("kind", NodeKind.UNKNOWN), NodeKind.FUNCTION):
+                continue
+            base_name = node.split("::")[-1].split('(')[0]  # remove args
+            poly_graph.add_node(node, base_name=base_name, full_name=node)
+        name_to_nodes = defaultdict(list)
+        for n, data in poly_graph.nodes(data=True):
+            name_to_nodes[data['base_name']].append(n)
+        for group in name_to_nodes.values():
+            for i in range(len(group)):
+                for j in range(i+1, len(group)):
+                    poly_graph.add_edge(group[i], group[j])
+                    poly_graph.add_edge(group[j], group[i])
+
+        # Overrides (inherits + overrides)
+        for u, v, data in self.edges(data=True):
+            if data.get("type") & EdgeType.INHERITS:
+                # u inherits from v
+                # if both u and v define a method with the same name
+                u_methods = {n for n in self.successors(u) if is_kind(self.nodes[n]['kind'], NodeKind.FUNCTION)}
+                v_methods = {n for n in self.successors(v) if is_kind(self.nodes[n]['kind'], NodeKind.FUNCTION)}
+                for um in u_methods:
+                    for vm in v_methods:
+                        if self._base_function_name(um) == self._base_function_name(vm):
+                            poly_graph.add_edge(um, vm)
+                            poly_graph.add_edge(vm, um)
+
+        # Step 2: Find equivalence classes (SCCs)
+        sccs = list(nx.strongly_connected_components(poly_graph))
+        func_to_equiv_class = {}
+        for idx, scc in enumerate(sccs):
+            for func in scc:
+                func_to_equiv_class[func] = scc
+
+        # Step 3: Redirect edges
+        for u, v, data in list(self.edges(data=True)):
+            if v in func_to_equiv_class:
+                equiv_class = func_to_equiv_class[v]
+                for alt_v in equiv_class:
+                    if not self.has_edge(u, alt_v):
+                        cleaned_data = {k: v for k, v in data.items() if k != "type"}
+                        self.add_edge_strict(u, alt_v, edge_type=data.get("type", EdgeType.UNKNOWN), **cleaned_data)
+
     
     def remove_unpickleable_attrs(self, graph):
         for node in graph.nodes:
@@ -646,8 +697,8 @@ class CodeAnalyzer:
         return graph
 
 
-    def _build_graph(self) -> nx.DiGraph:
-        self.graph = nx.DiGraph()    
+    def _build_graph(self):
+        self.clear()  
         uber_file = self.generate_uber_file()
         tu = self.parse_uber_file(uber_file)
         lib_subgraph_path = self.repo_path / "lib_subgraph.gpickle"
@@ -660,13 +711,16 @@ class CodeAnalyzer:
         self.collect_nodes(tu.cursor)
         if self.lib_subgraph:
             # Merge the library subgraph into the main graph
-            self.graph = nx.compose(self.graph, self.lib_subgraph)
-        print(f"Found {len(self.graph.nodes)} nodes")
+            composed = nx.compose(nx.DiGraph(self), self.lib_subgraph)
+            self.clear()
+            self.add_nodes_from(composed.nodes(data=True))
+            self.add_edges_from(composed.edges(data=True))
+        print(f"Found {len(self.nodes)} nodes")
         self.collect_edges(tu.cursor, None)
-        print(f"Found {len(self.graph.edges)} edges")
+        print(f"Found {len(self.edges)} edges")
         # Remove the uber file node
-        if uber_file.name in self.graph:
-            self.graph.remove_node(uber_file.name)
+        if uber_file.name in self:
+            self.remove_node(uber_file.name)
         # Delete the uber file
         try:
             os.remove(uber_file)
@@ -703,13 +757,13 @@ class CodeAnalyzer:
         # Filter nodes
         if node_filter:
             filtered_nodes = [
-                node for node, attrs in self.graph.nodes(data=True) if node_filter(node, attrs)
+                node for node, attrs in self.nodes(data=True) if node_filter(node, attrs)
             ]
         else:
-            filtered_nodes = list(self.graph.nodes)
+            filtered_nodes = list(self.nodes)
     
         # Create a subgraph with the filtered nodes
-        induced_graph = self.graph.subgraph(filtered_nodes).copy()
+        induced_graph = nx.DiGraph(self).subgraph(filtered_nodes).copy()
     
         # Filter edges
         if edge_filter:

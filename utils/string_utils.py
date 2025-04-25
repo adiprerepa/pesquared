@@ -13,66 +13,81 @@ import random
 import re
 import hashlib
 
-def hash_identifier(name):
-    # Creates a short valid C++ identifier from a SHA-1 hash
-    return '_obf_' + hashlib.sha1(name.encode()).hexdigest()[:8]
+import re
+import random
+import re
+from difflib import SequenceMatcher
+from typing import List, Tuple
 
-@lru_cache(maxsize=None)
-def legible_identifier(name):
-    return f'o_{random.choice(word_list)}'
+def parse_diff(diff_text: str) -> List[str]:
+    """
+    Parse a diff chunk without assuming hunk headers.
+    Extract unchanged context lines (prefixed with ' ') for matching.
+    """
+    lines = diff_text.strip().splitlines()
+    context = [line[1:] for line in lines if line.startswith(' ')]
+    return context
+
+def fitness(corpus: List[str], context: List[str], start: int) -> float:
+    """
+    Compute similarity ratio between context lines and a window in corpus starting at `start`.
+    """
+    window = corpus[start:start + len(context)]
+    return SequenceMatcher(None, context, window).ratio()
+
+def ga_match(
+    corpus: str,
+    diff_text: str,
+    pop_size: int = 50,
+    generations: int = 100,
+    mutation_rate: float = 0.1
+) -> Tuple[int, float]:
+    """
+    Use a genetic algorithm to find the best start index in `corpus`
+    that matches the diff context in `diff_text`.
+    
+    Returns:
+        best_start: best matching start index (0-based)
+        best_score: similarity ratio
+    """
+    corpus_lines = corpus.splitlines()
+    context = parse_diff(diff_text)
+    max_start = max(0, len(corpus_lines) - len(context))
+    
+    # Initialize population: random start indices
+    population = [random.randint(0, max_start) for _ in range(pop_size)]
+    
+    for gen in range(generations):
+        # Evaluate fitness
+        scored = [(idx, fitness(corpus_lines, context, idx)) for idx in population]
+        # Keep the top half
+        scored.sort(key=lambda x: x[1], reverse=True)
+        survivors = [idx for idx, _ in scored[:pop_size // 2]]
+        
+        # Produce next generation
+        next_pop = survivors.copy()
+        while len(next_pop) < pop_size:
+            if random.random() < mutation_rate:
+                # Mutation: tweak a survivor's start index
+                base = random.choice(survivors)
+                delta = random.randint(-5, 5)
+                new_idx = min(max(base + delta, 0), max_start)
+                next_pop.append(new_idx)
+            else:
+                # Crossover: combine two survivors
+                a, b = random.sample(survivors, 2)
+                # child is midpoint
+                child = (a + b) // 2
+                next_pop.append(child)
+        population = next_pop
+    
+    # Final evaluation
+    final_scored = [(idx, fitness(corpus_lines, context, idx)) for idx in population]
+    best_start, best_score = max(final_scored, key=lambda x: x[1])
+    return best_start, best_score
 
 
-def obfuscate_cpp_code_with_map(code, identifier_function=hash_identifier, exclude_stdlib=True):
-    identifier_pattern = r'\b([a-zA-Z_][a-zA-Z_0-9]*)\b'
 
-    whitelist = {
-        'int', 'float', 'double', 'char', 'bool', 'void', 'class', 'struct',
-        'if', 'else', 'for', 'while', 'switch', 'case', 'return', 'break',
-        'continue', 'public', 'private', 'protected', 'const', 'static',
-        'inline', 'virtual', 'template', 'typename', 'using', 'namespace',
-        'include', 'new', 'delete', 'this', 'true', 'false', 'nullptr',
-        'operator', 'override', 'typedef', 'enum', 'sizeof', 'do', 'goto',
-        'extern', 'union', 'volatile', 'register', 'friend', 'explicit',
-        'try', 'catch', 'throw', 'noexcept', 'default', 'constexpr', 'inline'
-    }
-
-    if exclude_stdlib:
-        whitelist.update({
-            'std', 'cout', 'cin', 'string', 'vector', 'map', 'set', 'list',
-            'deque', 'unordered_map', 'unordered_set', 'algorithm', 'iostream',
-            'fstream', 'sstream', 'iomanip', 'cmath', 'cstdlib', 'cstring',
-            'ctime', 'cassert', 'cctype', 'climits'
-        })
-
-    identifiers = set(re.findall(identifier_pattern, code))
-    identifiers = {idf for idf in identifiers if idf not in whitelist}
-    # loop through the identifiers and build the obfuscation map
-    obfuscation_map = {}
-    for idf in identifiers:
-        # Check if the identifier is already in the obfuscation map
-        if idf not in obfuscation_map:
-            # Create a new identifier using the identifier function
-            new_idf = identifier_function(idf)
-            # Ensure the new identifier is unique
-            while new_idf in obfuscation_map.values() or new_idf in whitelist:
-                new_idf = identifier_function(idf)
-            obfuscation_map[idf] = new_idf
-    sorted_identifiers = sorted(obfuscation_map.keys(), key=len, reverse=True)
-
-    for idf in sorted_identifiers:
-        code = re.sub(r'\b{}\b'.format(re.escape(idf)), obfuscation_map[idf], code)
-
-    return code, obfuscation_map
-
-
-def deobfuscate_cpp_code(obfuscated_code, obfuscation_map):
-    reverse_map = {v: k for k, v in obfuscation_map.items()}
-    sorted_keys = sorted(reverse_map.keys(), key=len, reverse=True)
-
-    for obf in sorted_keys:
-        obfuscated_code = re.sub(r'\b{}\b'.format(re.escape(obf)), reverse_map[obf], obfuscated_code)
-
-    return obfuscated_code
 
 def remove_comments(code: str) -> str:
     """
@@ -121,49 +136,73 @@ def arr_from_numbered_list(string: str):
     withNumbers = arr_from_sep_string(string, "\n")
     return [x.split(' ')[1] for x in withNumbers]
 
+import re
+from collections import defaultdict
+from difflib import get_close_matches
+
+class FuzzyDict(dict):
+    """
+    A dict that, on missing keys, returns the value for the closest existing key
+    (by simple string similarity) instead of raising KeyError.
+    """
+    def __init__(self, *args, cutoff: float = 0.6, max_matches: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cutoff = cutoff
+        self.max_matches = max_matches
+
+    def __getitem__(self, key):
+        # exact hit?
+        if key in self:
+            return super().__getitem__(key)
+
+        # try fuzzy match
+        matches = get_close_matches(key, self.keys(), 
+                                    n=self.max_matches, 
+                                    cutoff=self.cutoff)
+        if matches:
+            best = matches[0]
+            return super().__getitem__(best)
+
+        # still no luck
+        raise KeyError(f"{key!r} not found and no close match above cutoff={self.cutoff}")
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 def extract_markdown_blocks(text):
     """
     Extract markdown blocks from a string.
 
-    Parameters:
-    text (str): The input string containing markdown blocks.
-
-    Returns:
-    list: A list of strings, each representing a markdown block.
+    Returns a list of the code/text inside ```...``` fences.
     """
-    pattern = re.compile(r"```(.*?)\n(.*?)```", re.DOTALL)
-    blocks = pattern.findall(text)
-    blocks = [block[1].strip() for block in blocks]
-    return blocks
+    pattern = re.compile(r"```(?:[\w+\-]*)\n(.*?)```", re.DOTALL)
+    return [m.strip() for m in pattern.findall(text)]
+
 
 def markdown_to_dict(markdown: str) -> dict:
-    # Regular expression to match headers
+    """
+    Parse a markdown document into a dict of {header: content}.
+    Headers are normalized to lowercase.
+    """
     header_regex = re.compile(r'^(#+)\s*(.*)', re.MULTILINE)
-    
-    # Dictionary to store the result
     result = defaultdict(str)
-    
-    # Find all headers
-    headers = [(m.group(1).count('#'), m.group(2), m.start()) for m in header_regex.finditer(markdown)]
-    
-    # Sort headers by their position in the text
+
+    headers = [(m.group(1).count('#'), m.group(2), m.start()) 
+               for m in header_regex.finditer(markdown)]
     headers.sort(key=lambda x: x[2])
-    
-    for i in range(len(headers)):
-        current_header = headers[i]
-        header_level, header_text, header_start = current_header
-        
-        # Find the end of the current header's content
-        if i + 1 < len(headers):
-            next_header_start = headers[i + 1][2]
-            content = markdown[header_start + len(current_header[1]) + header_level + 1:next_header_start].strip()
-        else:
-            content = markdown[header_start + len(current_header[1]) + header_level + 1:].strip()
-        
-        # Add to result dictionary
-        result[header_text.lower()] = content
-    
-    return dict(result)
+
+    for i, (level, title, start) in enumerate(headers):
+        end = headers[i+1][2] if i+1 < len(headers) else len(markdown)
+        # slice out everything between the end of this header line and the next header
+        content_start = start + len(title) + level + 1
+        content = markdown[content_start:end].strip()
+        result[title.lower()] = content
+
+    return FuzzyDict(result)
 
 def wordwise_tokenize(text):
     """Tokenizes a sequence into words, punctuation, and whitespace
@@ -527,6 +566,9 @@ def skwonk(database: str, diff: str):
         original = ''.join([line for line in hunk.splitlines(keepends=True) if not line.startswith('+')])
         # 1. Zone in on the string we are going to be editing
         zone, _ = fuzzy_find(original, database[i:])
+        if not zone:
+            print("No zone found")
+            return database
         i = database.find(zone) + len(zone)
         original_zone = zone
         if zone is None:
