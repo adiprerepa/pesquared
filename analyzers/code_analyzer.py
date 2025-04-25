@@ -75,16 +75,8 @@ def is_kind(node, kind):
     return (node & kind) == kind
 
 class CodeAnalyzer(nx.DiGraph):
-    # def __init__(self, repo_path: Path):
-    #     self.repo_path = Path(repo_path).resolve()
-    #     self._file_cache: Dict[str, List[str]] = {}
-    #     self._init_clang()
-    #     self.index = cindex.Index.create()
-    #     self.branch = get_current_branch(self.repo_path)
-    #     self.lib_subgraph : Optional[nx.DiGraph] = None
-    #     self._build_graph()
-    
     def __init__(self, url: str, branch: str):
+        """Initialize the CodeAnalyzer with a repository URL and branch."""
         super().__init__()
         repo = clone_repo(url, branch)
         self.repo_path = Path(repo.working_dir).resolve()
@@ -94,7 +86,6 @@ class CodeAnalyzer(nx.DiGraph):
         self.branch = get_current_branch(self.repo_path)
         self.lib_subgraph : Optional[nx.DiGraph] = None
         self._build_graph()
-        
 
     # ──────────────────── Clang init ───────────────────────────────────
 
@@ -645,6 +636,13 @@ class CodeAnalyzer(nx.DiGraph):
                         if self._base_function_name(um) == self._base_function_name(vm):
                             poly_graph.add_edge(um, vm)
                             poly_graph.add_edge(vm, um)
+                u_variables = {n for n in self.successors(u) if is_kind(self.nodes[n]['kind'], NodeKind.VARIABLE)}
+                v_variables = {n for n in self.successors(v) if is_kind(self.nodes[n]['kind'], NodeKind.VARIABLE)}
+                for uv in u_variables:
+                    for vv in v_variables:
+                        if self._base_function_name(uv) == self._base_function_name(vv):
+                            poly_graph.add_edge(uv, vv)
+                            poly_graph.add_edge(vv, uv)
 
         # Step 2: Find equivalence classes (SCCs)
         sccs = list(nx.strongly_connected_components(poly_graph))
@@ -736,6 +734,18 @@ class CodeAnalyzer(nx.DiGraph):
             with open(lib_subgraph_path, "wb") as f:
                 pickle.dump(self.remove_unpickleable_attrs(self.lib_subgraph), f)
             print(f"✅ Library subgraph saved to {lib_subgraph_path}")
+        # Add Makefile node
+        makefile = self.repo_path / "Makefile"
+        print(f"Searching for Makefile in {self.repo_path}")
+        if makefile.exists():
+            with open(makefile, "r") as f:
+                code = f.read()
+                # make a new node for each X := .... line
+                print(f"Found Makefile: {makefile}")
+                for line in code.splitlines():
+                    if ":=" in line:
+                        name = line.split(":=")[0].strip()
+                        self.add_node(name, kind=NodeKind.VARIABLE | NodeKind.IN_CODEBASE, code=line)
     
     def induce_subgraph(
         self,

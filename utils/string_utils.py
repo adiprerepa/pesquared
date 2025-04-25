@@ -19,75 +19,6 @@ import re
 from difflib import SequenceMatcher
 from typing import List, Tuple
 
-def parse_diff(diff_text: str) -> List[str]:
-    """
-    Parse a diff chunk without assuming hunk headers.
-    Extract unchanged context lines (prefixed with ' ') for matching.
-    """
-    lines = diff_text.strip().splitlines()
-    context = [line[1:] for line in lines if line.startswith(' ')]
-    return context
-
-def fitness(corpus: List[str], context: List[str], start: int) -> float:
-    """
-    Compute similarity ratio between context lines and a window in corpus starting at `start`.
-    """
-    window = corpus[start:start + len(context)]
-    return SequenceMatcher(None, context, window).ratio()
-
-def ga_match(
-    corpus: str,
-    diff_text: str,
-    pop_size: int = 50,
-    generations: int = 100,
-    mutation_rate: float = 0.1
-) -> Tuple[int, float]:
-    """
-    Use a genetic algorithm to find the best start index in `corpus`
-    that matches the diff context in `diff_text`.
-    
-    Returns:
-        best_start: best matching start index (0-based)
-        best_score: similarity ratio
-    """
-    corpus_lines = corpus.splitlines()
-    context = parse_diff(diff_text)
-    max_start = max(0, len(corpus_lines) - len(context))
-    
-    # Initialize population: random start indices
-    population = [random.randint(0, max_start) for _ in range(pop_size)]
-    
-    for gen in range(generations):
-        # Evaluate fitness
-        scored = [(idx, fitness(corpus_lines, context, idx)) for idx in population]
-        # Keep the top half
-        scored.sort(key=lambda x: x[1], reverse=True)
-        survivors = [idx for idx, _ in scored[:pop_size // 2]]
-        
-        # Produce next generation
-        next_pop = survivors.copy()
-        while len(next_pop) < pop_size:
-            if random.random() < mutation_rate:
-                # Mutation: tweak a survivor's start index
-                base = random.choice(survivors)
-                delta = random.randint(-5, 5)
-                new_idx = min(max(base + delta, 0), max_start)
-                next_pop.append(new_idx)
-            else:
-                # Crossover: combine two survivors
-                a, b = random.sample(survivors, 2)
-                # child is midpoint
-                child = (a + b) // 2
-                next_pop.append(child)
-        population = next_pop
-    
-    # Final evaluation
-    final_scored = [(idx, fitness(corpus_lines, context, idx)) for idx in population]
-    best_start, best_score = max(final_scored, key=lambda x: x[1])
-    return best_start, best_score
-
-
-
 
 def remove_comments(code: str) -> str:
     """
@@ -173,13 +104,18 @@ class FuzzyDict(dict):
             return default
 
 
-def extract_markdown_blocks(text):
+def extract_markdown_blocks(text: str, returnLanguage: bool = False) -> list:
     """
     Extract markdown blocks from a string.
 
     Returns a list of the code/text inside ```...``` fences.
     """
     pattern = re.compile(r"```(?:[\w+\-]*)\n(.*?)```", re.DOTALL)
+    language = re.compile(r"^```([\w+\-]*)\n", re.MULTILINE)
+    if returnLanguage:
+        matches = pattern.findall(text)
+        languages = language.findall(text)
+        return [(m.strip(), l) for m, l in zip(matches, languages)]
     return [m.strip() for m in pattern.findall(text)]
 
 
