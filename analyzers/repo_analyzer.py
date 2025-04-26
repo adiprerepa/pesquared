@@ -1016,62 +1016,176 @@ class RepoAnalyzer(nx.DiGraph):
     
     # ──────────────────── CFG helpers ─────────────────────────────
 
-    def build_cfg(self, filename):
-        index = self.index
-        tu = index.parse(filename)
-        
-        if not tu:
-            print(f"Error: Failed to parse {filename}")
-            return
+    def build_cfg(cursor: cindex.Cursor) -> nx.DiGraph:
+        """
+        Given a clang.cindex.Cursor pointing at a function or compound statement,
+        build and return a NetworkX DiGraph representing its control-flow graph.
+        Nodes have attributes:
+        - 'ast': the Cursor for the statement
+        - 'label': a short label (e.g. 'if_cond', 'for_body', etc.)
+        Special nodes: '__entry__' and '__exit__'.
+        """
+        G = nx.DiGraph()
+        entry, exit = '__entry__', '__exit__'
+        G.add_node(entry), G.add_node(exit)
 
-        cfg = {}
-        
-        def traverse(node, parent_block=None):
-            nonlocal cfg
-            
-            if node.kind == cindex.CursorKind.FUNCTION_DECL:
-                function_name = node.spelling
-                cfg[function_name] = {'blocks': {}, 'edges': []}
-                block_id = 0
-                current_block = {'id': block_id, 'statements': []}
-                cfg[function_name]['blocks'][block_id] = current_block
-                
-                for child in node.get_children():
-                    traverse(child, current_block)
-            
-            elif node.kind in (cindex.CursorKind.IF_STMT, cindex.CursorKind.FOR_STMT, cindex.CursorKind.WHILE_STMT):
-            
-                block_id = len(cfg[function_name]['blocks'])
-                true_branch_block = {'id': block_id, 'statements': []}
-                cfg[function_name]['blocks'][block_id] = true_branch_block
-                
-                block_id = len(cfg[function_name]['blocks'])
-                false_branch_block = {'id': block_id, 'statements': []}
-                cfg[function_name]['blocks'][block_id] = false_branch_block
-                
-                cfg[function_name]['edges'].append((parent_block['id'], true_branch_block['id'], f"Condition: {node.spelling} is True"))
-                cfg[function_name]['edges'].append((parent_block['id'], false_branch_block['id'], f"Condition: {node.spelling} is False"))
-                
-                for child in node.get_children():
-                    if child.kind == cindex.CursorKind.COMPOUND_STMT:
-                        for grandchild in child.get_children():
-                            traverse(grandchild, true_branch_block)
-            
-            elif node.kind == cindex.CursorKind.RETURN_STMT:
-                current_block['statements'].append(node.spelling)
-                
-                block_id = len(cfg[function_name]['blocks'])
-                next_block = {'id': block_id, 'statements': []}
-                cfg[function_name]['blocks'][block_id] = next_block
-                cfg[function_name]['edges'].append((current_block['id'], next_block['id'], "Return"))
-            
-            elif parent_block:
-                parent_block['statements'].append(node.spelling)
-                
-        for node in tu.cursor.get_children():
-            traverse(node)
+        # For goto/label resolution
+        label_map = {}            # label spelling -> node ID
+        pending_gotos = []        # list of (label, goto_node_id) to resolve later
 
-        return cfg
+        # Simple counter for unique node IDs
+        _counter = [0]
+        def unique_id(prefix: str) -> str:
+            _counter[0] += 1
+            return f"{prefix}_{_counter[0]}"
+
+        def make_node(ast: cindex.Cursor, label: str) -> str:
+            nid = unique_id(label)
+            G.add_node(nid, ast=ast, label=label)
+            return nid
+
+        def link(prev_nodes, next_node):
+            for p in prev_nodes:
+                G.add_edge(p, next_node)
+
+        def recurse(ast: cindex.Cursor, prev_nodes):
+            # Dispatch on kind
+            kind = ast.kind
+
+            # Compound: just sequence through children
+            if kind == cindex.CursorKind.COMPOUND_STMT:
+                cur = prev_nodes
+                for child in ast.get_children():
+                    cur = recurse(child, cur)
+                return cur
+
+            # IF / ELSE IF / ELSE
+            if kind == cindex.CursorKind.IF_STMT:
+                # AST children: [cond, then, else?]
+                children = list(ast.get_children())
+                cond_node = make_node(ast, 'if_cond')
+                link(prev_nodes, cond_node)
+
+                then_node = children[1] if len(children) > 1 else None
+                else_node = children[2] if len(children) > 2 else None
+
+                # process the "then" branch
+                then_exit = recurse(then_node, [cond_node]) if then_node else [cond_node]
+                # process the "else" branch (could itself be another IF => else-if)
+                else_exit = recurse(else_node, [cond_node]) if else_node else [cond_node]
+
+                # merge exits
+                return then_exit + else_exit
+
+            # WHILE loop
+            if kind == cindex.CursorKind.WHILE_STMT:
+                children = list(ast.get_children())
+                cond_cursor = children[0]
+                body_cursor = children[1] if len(children) > 1 else None
+
+                cond_node = make_node(ast, 'while_cond')
+                link(prev_nodes, cond_node)
+
+                body_exit = recurse(body_cursor, [cond_node]) if body_cursor else [cond_node]
+                for b in body_exit:
+                    G.add_edge(b, cond_node)   # back‐edge
+
+                # false‐branch falls through to next
+                return [cond_node]
+
+            # FOR loop
+            if kind == cindex.CursorKind.FOR_STMT:
+                # AST children: [init?, cond?, inc?, body]
+                children = list(ast.get_children())
+                init, cond_c, inc, body = None, None, None, None
+                if len(children) >= 1: init = children[0]
+                if len(children) >= 2: cond_c = children[1]
+                if len(children) >= 3: inc = children[2]
+                if len(children) >= 4: body = children[3]
+
+                # initializer
+                cur = recurse(init, prev_nodes) if init else prev_nodes
+
+                # condition check
+                cond_node = make_node(ast, 'for_cond')
+                link(cur, cond_node)
+
+                # body
+                body_exit = recurse(body, [cond_node]) if body else [cond_node]
+                # increment
+                inc_exit = recurse(inc, body_exit) if inc else body_exit
+                # back to test
+                for i in inc_exit:
+                    G.add_edge(i, cond_node)
+
+                # false-branch exits via cond_node
+                return [cond_node]
+
+            # SWITCH / CASE / DEFAULT
+            if kind == cindex.CursorKind.SWITCH_STMT:
+                cond_node = make_node(ast, 'switch_cond')
+                link(prev_nodes, cond_node)
+                exits = []
+
+                for child in ast.get_children():
+                    if child.kind in (cindex.CursorKind.CASE_STMT,
+                                    cindex.CursorKind.DEFAULT_STMT):
+                        case_node = make_node(child, 'case')
+                        G.add_edge(cond_node, case_node)
+                        case_exit = recurse(child, [case_node])
+                        exits.extend(case_exit)
+
+                return exits or [cond_node]
+
+            # LABEL
+            if kind == cindex.CursorKind.LABEL_STMT:
+                lbl = ast.spelling
+                lbl_node = make_node(ast, f'label_{lbl}')
+                link(prev_nodes, lbl_node)
+                label_map[lbl] = lbl_node
+
+                # resolve any gotos waiting on this label
+                for (want_lbl, goto_nid) in list(pending_gotos):
+                    if want_lbl == lbl:
+                        G.add_edge(goto_nid, lbl_node)
+                        pending_gotos.remove((want_lbl, goto_nid))
+                return [lbl_node]
+
+            # GOTO
+            if kind == cindex.CursorKind.GOTO_STMT:
+                # child is the label reference
+                tgt = next(ast.get_children()).spelling
+                goto_nid = make_node(ast, f'goto_{tgt}')
+                link(prev_nodes, goto_nid)
+
+                if tgt in label_map:
+                    G.add_edge(goto_nid, label_map[tgt])
+                else:
+                    pending_gotos.append((tgt, goto_nid))
+                # no fall‐through after goto
+                return []
+
+            # RETURN
+            if kind == cindex.CursorKind.RETURN_STMT:
+                ret_nid = make_node(ast, 'return')
+                link(prev_nodes, ret_nid)
+                G.add_edge(ret_nid, exit)
+                return []
+
+            # Everything else: one basic node
+            simple_nid = make_node(ast, kind.name.lower())
+            link(prev_nodes, simple_nid)
+            return [simple_nid]
+
+        # start recursion on the function/compound root
+        final_exits = recurse(cursor, [entry])
+
+        # anything that didn't explicitly return/goto should go to exit
+        for n in final_exits:
+            G.add_edge(n, exit)
+
+        return G
+
 
     def lookup_functions(self, file: str, line: int) -> Optional[str]:
         """

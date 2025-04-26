@@ -6,7 +6,7 @@ from google import generativeai as genai
 from google.generativeai import types
 from collections import deque
 import networkx as nx
-from analyzers.code_analyzer import NodeKind, RepoAnalyzer, is_kind
+from analyzers.repo_analyzer import NodeKind, RepoAnalyzer, is_kind
 from analyzers.stack_analyzer import StackAnalyzer, FunctionStats
 from dotenv import load_dotenv
 
