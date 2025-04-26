@@ -74,9 +74,9 @@ class EdgeType(IntFlag):
 def is_kind(node, kind):
     return (node & kind) == kind
 
-class CodeAnalyzer(nx.DiGraph):
+class RepoAnalyzer(nx.DiGraph):
     def __init__(self, url: str, branch: str):
-        """Initialize the CodeAnalyzer with a repository URL and branch."""
+        """Initialize the RepoAnalyzer with a repository URL and branch."""
         super().__init__()
         repo = clone_repo(url, branch)
         self.repo_path = Path(repo.working_dir).resolve()
@@ -85,6 +85,13 @@ class CodeAnalyzer(nx.DiGraph):
         self.index = cindex.Index.create()
         self.branch = get_current_branch(self.repo_path)
         self.lib_subgraph : Optional[nx.DiGraph] = None
+        self.symbol_to_signatures: Dict[str, List[str]] = defaultdict(list)
+        # find a directory containing only .folded files
+        self.perfstacks_dir = None
+        for dp, _, files in os.walk(self.repo_path):
+            if all(f.endswith('.folded') for f in files) and len(files) > 0:
+                self.perfstacks_dir = Path(dp)
+                break
         self._build_graph()
 
     # ──────────────────── Clang init ───────────────────────────────────
@@ -595,7 +602,7 @@ class CodeAnalyzer(nx.DiGraph):
                 if len(set(split)) == 1:
                     base = split[-1]
                     if base in self.nodes:
-                        print(f"Merging node {base} into {n}")
+                        # print(f"Merging node {base} into {n}")
                         contracted = nx.contracted_nodes(nx.DiGraph(self), n, base, self_loops=False)
                         self.clear()
                         self.add_nodes_from(contracted.nodes(data=True))
@@ -606,7 +613,7 @@ class CodeAnalyzer(nx.DiGraph):
                 for succ in list(self.successors(n)):
                     if is_kind(self.nodes[succ]["kind"], NodeKind.VARIABLE):
                         for succ_succ in list(self.successors(succ)):
-                            print(f"Adding edge from {n} to {succ_succ}")
+                            # print(f"Adding edge from {n} to {succ_succ}")
                             self.add_edge_strict(n, succ_succ, edge_type=EdgeType.DEPENDENCY)
         
         poly_graph = nx.DiGraph()
@@ -735,8 +742,16 @@ class CodeAnalyzer(nx.DiGraph):
                 pickle.dump(self.remove_unpickleable_attrs(self.lib_subgraph), f)
             print(f"✅ Library subgraph saved to {lib_subgraph_path}")
         # Add Makefile node
+        self.add_makefile()
+        self.symbol_to_signatures = defaultdict(list)
+        for node, attrs in self.nodes(data=True):
+            if is_kind(attrs.get("kind", NodeKind.UNKNOWN), NodeKind.FUNCTION):
+                # Add the function signature to the symbol_to_signatures mapping
+                base_name = node.split('(')[0]
+                self.symbol_to_signatures[base_name].append(node)
+    
+    def add_makefile(self):
         makefile = self.repo_path / "Makefile"
-        print(f"Searching for Makefile in {self.repo_path}")
         if makefile.exists():
             with open(makefile, "r") as f:
                 code = f.read()
@@ -783,6 +798,87 @@ class CodeAnalyzer(nx.DiGraph):
             induced_graph.remove_edges_from(edges_to_remove)
     
         return induced_graph
+    
+    def write_function(self, function: str, code: str):
+        """Change `code` attribute of the `function` node and write it to a file."""
+        if function not in self:
+            print(f"Function {function} not found in the graph.")
+            return None
+        # Write to a file
+        fn = self.nodes[function].get("file", self.repo_path / f"{function}.cpp")
+        with open(fn, "r") as f:
+            current_code = f.read()
+        with open(fn, 'w') as f:
+            # replace function's code with the new code
+            current_code = current_code.replace(self.nodes[function]["code"], code)
+            f.write(current_code)
+        # Update the node's code attribute
+        self.nodes[function]["code"] = code
+        self._file_cache[fn] = current_code.splitlines()
+        return fn
+    
+    def add_imports(self, fn: str, imports: str):
+        """Add imports to the top of the file."""
+        if not os.path.exists(fn):
+            print(f"File {fn} does not exist.")
+            return None
+        with open(fn, "r") as f:
+            code = f.read()
+        with open(fn, "w") as f:
+            f.write(imports + "\n" + code)
+        return fn
+
+    def add_objects(self, fn: str, objects: str):
+        # Add objects below the includes
+        if not os.path.exists(fn):
+            print(f"File {fn} does not exist.")
+            return None
+        with open(fn, "r") as f:
+            code = f.readlines()
+
+        # Find the first non-include line
+        insert_index = 0
+        for i, line in enumerate(code):
+            if not line.startswith("#") and not line.strip() == "":
+                # Found the first non-include line
+                insert_index = i
+                break
+
+        # Insert the objects
+        updated_code = code[:insert_index] + [objects + "\n"] + code[insert_index:]
+
+        # Write back to the file
+        with open(fn, "w") as f:
+            f.writelines(updated_code)
+        return fn
+
+    def write_to_makefile(self, field: str, value: str):
+        """Write to the Makefile."""
+        makefile = self.repo_path / "Makefile"
+        if not makefile.exists():
+            print(f"Makefile {makefile} does not exist.")
+            return None
+
+        updated = False
+        lines = []
+        with open(makefile, "r") as f:
+            for line in f:
+                if line.strip().startswith(f"{field} :="):
+                    lines.append(f"{field} := {value}\n")
+                    updated = True
+                else:
+                    lines.append(line)
+
+        if not updated:
+            lines.append(f"{field} := {value}\n")
+
+        with open(makefile, "w") as f:
+            f.writelines(lines)
+
+        self.add_makefile()
+
+        return makefile
+
 
     def plot(self, horizontal=False, node_filter: Optional[callable] = None, edge_filter: Optional[callable] = None):
         filtered_graph = self.induce_subgraph(node_filter, edge_filter)
