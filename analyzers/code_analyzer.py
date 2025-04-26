@@ -1,16 +1,22 @@
+import bisect
 import os
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict, Set
+import tempfile
+import pydot
+from typing import Optional, List, Dict, Set, Tuple, Union
 import re
 import networkx as nx
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from clang import cindex
+import yaml
 from utils.cursor_utils import loc_info, CTOR_KINDS, FUNC_KINDS, TYPE_KINDS, TEMPLATE_PARAM_KINDS, MEMBER_KINDS, GLOBAL_KINDS
 from utils.git_utils import clone_repo, get_current_branch
 import pickle
 from analyzers.stack_analyzer import StackAnalyzer, FunctionStats
+from intervaltree import IntervalTree
 
 _CLANG_INITIALIZED = False
 
@@ -81,6 +87,7 @@ class RepoAnalyzer(nx.DiGraph):
         repo = clone_repo(url, branch)
         self.repo_path = Path(repo.working_dir).resolve()
         self._file_cache: Dict[str, List[str]] = {}
+        self._file_range_queries: Dict[str, IntervalTree] = {}
         self._init_clang()
         self.index = cindex.Index.create()
         self.branch = get_current_branch(self.repo_path)
@@ -270,9 +277,13 @@ class RepoAnalyzer(nx.DiGraph):
         for child in cursor.get_children():
             self.collect_nodes(child)
 
-    def in_proj(self, c: cindex.Cursor) -> bool:
-        """Check if a cursor is within the project."""
-        return bool(c.location.file) and Path(c.location.file.name).resolve().is_relative_to(self.repo_path)
+    def in_proj(self, c: Union[cindex.Cursor, Path]) -> bool:
+        """Check if a cursor/path is within the project."""
+        if not c: return False
+        if isinstance(c, cindex.Cursor): 
+            return bool(c.location.file) and Path(c.location.file.name).resolve().is_relative_to(self.repo_path)
+        else:
+            return c.resolve().is_relative_to(self.repo_path)
 
     def add_node_to_graph(self, name: str, kind: NodeKind, cursor: Optional[cindex.Cursor]) -> None:
         """Add a node to the graph."""
@@ -288,6 +299,8 @@ class RepoAnalyzer(nx.DiGraph):
                 attrs["code"] = self.read_extent(cursor)
                 attrs["ast"] = ast_outline
                 attrs["cursor"] = cursor
+                attrs['start_line'] = cursor.extent.start.line
+                attrs['end_line'] = cursor.extent.end.line
 
             self.add_node(name, **attrs)
 
@@ -547,10 +560,10 @@ class RepoAnalyzer(nx.DiGraph):
                     args.append(f'-I{d}')
         return args
 
-    def parse_file(self, index: cindex.Index, p: Path) -> Optional[cindex.TranslationUnit]:
+    def parse_file(self, p: Path) -> Optional[cindex.TranslationUnit]:
         try:
             args = self.COMMON_COMPILER_ARGS + self.make_include_args(p)
-            return index.parse(str(p), args=args,
+            return self.index.parse(str(p), args=args,
                             options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
         except Exception as e:
             print(f"Error parsing {p}: {e}")
@@ -565,10 +578,16 @@ class RepoAnalyzer(nx.DiGraph):
         includes = []
         for ext in (".hpp", ".h", ".cpp", ".cxx", ".cc"):
             for file in self.repo_path.rglob(f"*{ext}"):
-                if "test" in file.parts:  # optional: skip tests
+                # skip tests and skip the uber itself
+                if "test" in file.parts:
                     continue
+                if file.resolve() == output_file.resolve():
+                    continue
+
                 rel_path = file.relative_to(self.repo_path)
-                includes.append(f'#include "{rel_path}"')
+                line = f'#include "{rel_path}"'
+                if line not in includes:
+                    includes.append(line)
 
         content = "// AUTO-GENERATED UBER FILE\n" + "\n".join(sorted(includes)) + "\n"
         output_file.write_text(content)
@@ -705,8 +724,8 @@ class RepoAnalyzer(nx.DiGraph):
     def _build_graph(self):
         self.clear()  
         uber_file = self.generate_uber_file()
-        tu = self.parse_uber_file(uber_file)
-        lib_subgraph_path = self.repo_path / "lib_subgraph.gpickle"
+        tu = self.parse_file(uber_file)
+        lib_subgraph_path = Path('/home/ayuram/pesquared/dumps') / "lib_subgraph.gpickle"
         # Check if we have a lib_subgraph.gpickle
         if not self.lib_subgraph and lib_subgraph_path.exists():
             with open(lib_subgraph_path, "rb") as f:
@@ -723,14 +742,15 @@ class RepoAnalyzer(nx.DiGraph):
         print(f"Found {len(self.nodes)} nodes")
         self.collect_edges(tu.cursor, None)
         print(f"Found {len(self.edges)} edges")
-        # Remove the uber file node
-        if uber_file.name in self:
-            self.remove_node(uber_file.name)
-        # Delete the uber file
-        try:
-            os.remove(uber_file)
-        except Exception as e:
-            print(f"❌ Failed to remove uber file: {e}")
+        self.func_trees: Dict[str, IntervalTree] = {}
+        for fn, attrs in self.nodes(data=True):
+            if is_kind(attrs['kind'], NodeKind.FUNCTION) and is_kind(attrs['kind'], NodeKind.IN_CODEBASE):
+                file = attrs['file']
+                start, end = attrs['start_line'], attrs['end_line']
+                tree = self.func_trees.setdefault(file, IntervalTree())
+                # intervaltree uses half-open intervals [begin, end)
+                tree[start:end+1] = fn
+        # self._build_control_flow_graphs()
         self._close_graph()
         if not self.lib_subgraph:
             # store the subgraph of library nodes on disk
@@ -749,6 +769,27 @@ class RepoAnalyzer(nx.DiGraph):
                 # Add the function signature to the symbol_to_signatures mapping
                 base_name = node.split('(')[0]
                 self.symbol_to_signatures[base_name].append(node)
+        self.func_trees = {}
+        for fn, attrs in self.nodes(data=True):
+            if is_kind(attrs['kind'], NodeKind.FUNCTION) and is_kind(attrs['kind'], NodeKind.IN_CODEBASE):
+                file = attrs['file']
+                start, end = attrs['start_line'], attrs['end_line']
+                tree = self.func_trees.setdefault(file, IntervalTree())
+                # intervaltree uses half-open intervals [begin, end)
+                tree[start:end+1] = fn
+        # Compile the code with missed optimization remarks using the command `clang++ -O2 -fsave-optimization-record -c `uber_file`.cpp -o `uber_file`.o`
+        subprocess.run(["clang++", "-O2", "-fsave-optimization-record", "-c", str(uber_file), "-o", str(uber_file.with_suffix(".o"))])
+        self.parse_missed_optimizations(uber_file.with_suffix(".opt.yaml"))
+        # Remove the uber file node
+        if uber_file.name in self:
+            self.remove_node(uber_file.name)
+        # Delete the uber file
+        try:
+            os.remove(uber_file)
+            os.remove(uber_file.with_suffix(".o"))
+            os.remove(uber_file.with_suffix(".opt.yaml"))
+        except Exception as e:
+            print(f"❌ Failed to remove uber file: {e}")
     
     def add_makefile(self):
         makefile = self.repo_path / "Makefile"
@@ -933,28 +974,28 @@ class RepoAnalyzer(nx.DiGraph):
         node_colors = []
         for node in filtered_graph.nodes:
             kind = filtered_graph.nodes[node].get("kind", NodeKind.UNKNOWN)
-            if kind & NodeKind.FUNCTION:
+            if is_kind(kind, NodeKind.FUNCTION):
                 color = "lightblue" 
-                if kind & NodeKind.CONSTRUCTOR:
+                if is_kind(kind, NodeKind.CONSTRUCTOR):
                     color = "skyblue"
-                elif kind & NodeKind.DESTRUCTOR:
+                elif is_kind(kind, NodeKind.DESTRUCTOR):
                     color = "royalblue"
-            elif kind & NodeKind.TYPE:
+            elif is_kind(kind, NodeKind.TYPE):
                 color = "orange"
-            elif kind & NodeKind.VARIABLE:
+            elif is_kind(kind, NodeKind.VARIABLE):
                 color = "lightgreen"
             else:
-                color = "gray"
+                color = "red"
             node_colors.append(color)
 
         edge_colors = []
         for u, v, data in filtered_graph.edges(data=True):
-            edge_type = data.get("type", "unknown")
-            if edge_type & EdgeType.CALL:
+            edge_type = data.get("type", EdgeType.UNKNOWN)
+            if is_kind(edge_type, EdgeType.CALL):
                 color = "blue"
-            elif edge_type & EdgeType.REFERENCE:
+            elif is_kind(edge_type, EdgeType.REFERENCE):
                 color = "green"
-            elif edge_type & EdgeType.DEPENDENCY:
+            elif is_kind(edge_type, EdgeType.DEPENDENCY):
                 color = "orange"
             else:
                 color = "gray"
@@ -972,3 +1013,116 @@ class RepoAnalyzer(nx.DiGraph):
         plt.axis("off")
         plt.tight_layout()
         plt.show()
+    
+    # ──────────────────── CFG helpers ─────────────────────────────
+
+    def build_cfg(self, filename):
+        index = self.index
+        tu = index.parse(filename)
+        
+        if not tu:
+            print(f"Error: Failed to parse {filename}")
+            return
+
+        cfg = {}
+        
+        def traverse(node, parent_block=None):
+            nonlocal cfg
+            
+            if node.kind == cindex.CursorKind.FUNCTION_DECL:
+                function_name = node.spelling
+                cfg[function_name] = {'blocks': {}, 'edges': []}
+                block_id = 0
+                current_block = {'id': block_id, 'statements': []}
+                cfg[function_name]['blocks'][block_id] = current_block
+                
+                for child in node.get_children():
+                    traverse(child, current_block)
+            
+            elif node.kind in (cindex.CursorKind.IF_STMT, cindex.CursorKind.FOR_STMT, cindex.CursorKind.WHILE_STMT):
+            
+                block_id = len(cfg[function_name]['blocks'])
+                true_branch_block = {'id': block_id, 'statements': []}
+                cfg[function_name]['blocks'][block_id] = true_branch_block
+                
+                block_id = len(cfg[function_name]['blocks'])
+                false_branch_block = {'id': block_id, 'statements': []}
+                cfg[function_name]['blocks'][block_id] = false_branch_block
+                
+                cfg[function_name]['edges'].append((parent_block['id'], true_branch_block['id'], f"Condition: {node.spelling} is True"))
+                cfg[function_name]['edges'].append((parent_block['id'], false_branch_block['id'], f"Condition: {node.spelling} is False"))
+                
+                for child in node.get_children():
+                    if child.kind == cindex.CursorKind.COMPOUND_STMT:
+                        for grandchild in child.get_children():
+                            traverse(grandchild, true_branch_block)
+            
+            elif node.kind == cindex.CursorKind.RETURN_STMT:
+                current_block['statements'].append(node.spelling)
+                
+                block_id = len(cfg[function_name]['blocks'])
+                next_block = {'id': block_id, 'statements': []}
+                cfg[function_name]['blocks'][block_id] = next_block
+                cfg[function_name]['edges'].append((current_block['id'], next_block['id'], "Return"))
+            
+            elif parent_block:
+                parent_block['statements'].append(node.spelling)
+                
+        for node in tu.cursor.get_children():
+            traverse(node)
+
+        return cfg
+
+    def lookup_functions(self, file: str, line: int) -> Optional[str]:
+        """
+        Lookup the function name at a given file and line number.
+        Returns the function name or None if not found.
+        """
+        return [iv.data for iv in self.func_trees.get(file, IntervalTree()).at(line)]
+
+    def parse_missed_optimizations(self, yaml_path):
+        """
+        Parse a Clang .opt.yaml file and extract all !Missed records.
+
+        Returns a list of dicts:
+        [ { 'file': <path>, 'line': <int>, 'comment': <str> }, … ]
+        """
+        # 1) Tell PyYAML how to handle the !Missed (and other !) tags:
+        def unknown_tag_constructor(loader, tag_suffix, node):
+            data = loader.construct_mapping(node, deep=True)
+            data['_YamlTag_'] = tag_suffix
+            return data
+
+        SafeLoader = yaml.SafeLoader
+        SafeLoader.add_multi_constructor('!', unknown_tag_constructor)
+        def reconstruct_message(doc):
+            pieces = []
+            for arg in doc.get('Args', []):
+                if isinstance(arg, dict) and 'String' in arg:
+                    pieces.append(arg['String'])
+                elif 'Callee' in arg:
+                    pieces.append(self.demangle(arg['Callee']))
+                elif 'Caller' in arg:
+                    pieces.append(self.demangle(arg['Caller']))
+                # (handle other human names/types as needed)
+            return ''.join(pieces).strip()
+        with open(yaml_path, 'r') as stream:
+            for doc in yaml.load_all(stream, Loader=SafeLoader):
+                # Only care about !Missed entries
+                if isinstance(doc, dict) and doc.get('_YamlTag_') == 'Missed':
+                    dbg = doc.get('DebugLoc', {})
+                    src_file = dbg.get('File')
+                    if not src_file: continue
+                    src_file = os.path.abspath(src_file)
+                    if not self.in_proj(Path(src_file)): continue
+                    line_no  = dbg.get('Line')
+                    comment  = reconstruct_message(doc)  # e.g. "NoDefinition", "LoadClobbered", etc.
+                    functions = self.lookup_functions(src_file, line_no)
+                    if not functions:
+                        continue
+                    for func in functions:
+                        if 'missed_optimizations' not in self.nodes[func]:
+                            self.nodes[func]['missed_optimizations'] = defaultdict(set)
+                        normalized_line_number = line_no - self.nodes[func]['start_line']
+                        self.nodes[func]['missed_optimizations'][normalized_line_number].add(comment)
+

@@ -9,3 +9,7 @@ python-dotenv>=1.0.0
 tabulate
 pyyaml
 cxxfilt
+pydot
+networkx
+matplotlib
+intervaltree
