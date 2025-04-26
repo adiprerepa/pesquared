@@ -101,6 +101,28 @@ class RepoAnalyzer(nx.DiGraph):
                 break
         self._build_graph()
 
+    @classmethod
+    def from_path(cls, path: str):
+        """Initialize the RepoAnalyzer with an existing directory path."""
+        instance = cls.__new__(cls)
+        super(RepoAnalyzer, instance).__init__()
+        instance.repo_path = Path(path).resolve()
+        instance._file_cache: Dict[str, List[str]] = {}
+        instance._file_range_queries: Dict[str, IntervalTree] = {}
+        instance._init_clang()
+        instance.index = cindex.Index.create()
+        instance.branch = get_current_branch(instance.repo_path)
+        instance.lib_subgraph : Optional[nx.DiGraph] = None
+        instance.symbol_to_signatures: Dict[str, List[str]] = defaultdict(list)
+        # find a directory containing only .folded files
+        instance.perfstacks_dir = None
+        for dp, _, files in os.walk(instance.repo_path):
+            if all(f.endswith('.folded') for f in files) and len(files) > 0:
+                instance.perfstacks_dir = Path(dp)
+                break
+        instance._build_graph()
+        return instance
+
     # ──────────────────── Clang init ───────────────────────────────────
 
     def _init_clang(self) -> None:
