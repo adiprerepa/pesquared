@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Set, Tuple, Union
 import re
 import networkx as nx
 import matplotlib.pyplot as plt
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from clang import cindex
 import yaml
 from utils.cursor_utils import loc_info, CTOR_KINDS, FUNC_KINDS, TYPE_KINDS, TEMPLATE_PARAM_KINDS, MEMBER_KINDS, GLOBAL_KINDS
@@ -80,17 +80,31 @@ class EdgeType(IntFlag):
 def is_kind(node, kind):
     return (node & kind) == kind
 
+def in_repo_and_not_variable(node, attr):
+    return is_kind(attr['kind'], NodeKind.IN_CODEBASE) and not is_kind(attr['kind'], NodeKind.VARIABLE)
+
+def in_repo(node, attr):
+    return is_kind(attr['kind'], NodeKind.IN_CODEBASE)
+
+def is_function(node, attr):
+    return is_kind(attr['kind'], NodeKind.FUNCTION)
+
+def is_variable(node, attr):
+    return is_kind(attr['kind'], NodeKind.VARIABLE)
+
+def is_type(node, attr):
+    return is_kind(attr['kind'], NodeKind.TYPE)
+
 class RepoAnalyzer(nx.DiGraph):
     def __init__(self, url: str, branch: str):
         """Initialize the RepoAnalyzer with a repository URL and branch."""
         super().__init__()
         repo = clone_repo(url, branch)
         self.repo_path = Path(repo.working_dir).resolve()
-        self._file_cache: Dict[str, List[str]] = {}
+        self._file_cache: Dict[str, OrderedDict[List[str]]] = {}
         self._file_range_queries: Dict[str, IntervalTree] = {}
         self._init_clang()
         self.index = cindex.Index.create()
-        self.branch = get_current_branch(self.repo_path)
         self.lib_subgraph : Optional[nx.DiGraph] = None
         self.symbol_to_signatures: Dict[str, List[str]] = defaultdict(list)
         # find a directory containing only .folded files
@@ -107,13 +121,12 @@ class RepoAnalyzer(nx.DiGraph):
         instance = cls.__new__(cls)
         super(RepoAnalyzer, instance).__init__()
         instance.repo_path = Path(path).resolve()
-        instance._file_cache: Dict[str, List[str]] = {}
-        instance._file_range_queries: Dict[str, IntervalTree] = {}
+        instance._file_cache = {}
+        instance._file_range_queries = {}
         instance._init_clang()
         instance.index = cindex.Index.create()
-        instance.branch = get_current_branch(instance.repo_path)
-        instance.lib_subgraph : Optional[nx.DiGraph] = None
-        instance.symbol_to_signatures: Dict[str, List[str]] = defaultdict(list)
+        instance.lib_subgraph = None
+        instance.symbol_to_signatures = defaultdict(list)
         # find a directory containing only .folded files
         instance.perfstacks_dir = None
         for dp, _, files in os.walk(instance.repo_path):
@@ -122,6 +135,10 @@ class RepoAnalyzer(nx.DiGraph):
                 break
         instance._build_graph()
         return instance
+    
+    @property
+    def branch(self):
+        return get_current_branch(self.repo_path)
 
     # ──────────────────── Clang init ───────────────────────────────────
 
@@ -199,20 +216,26 @@ class RepoAnalyzer(nx.DiGraph):
             parts.append(cur.spelling)
         n = "::".join(parts)
         return self.demangle(n) if self.is_mangled(n) else n
+    
+    def get_file(self, file_name: str):
+        """Get the file name from the cache or read it from disk."""
+        if file_name not in self._file_cache:
+            try:
+                with open(file_name, 'r', encoding='utf-8', errors='ignore') as f:
+                    self._file_cache[file_name] = {self.branch: f.readlines()}
+            except:
+                self._file_cache[file_name] = {self.branch: []}
+        if self.branch not in self._file_cache[file_name]:
+            # pick the first key, which is the default branch
+            return self._file_cache[file_name][list(self._file_cache[file_name].keys())[0]]
+        return self._file_cache[file_name][self.branch]
 
     def read_extent(self, cur: cindex.Cursor) -> str:
         ext = cur.extent
         if not ext or not ext.start.file:
             return ""
         fn = ext.start.file.name
-        if fn not in self._file_cache:
-            try:
-                with open(fn, 'r', encoding='utf-8', errors='ignore') as f:
-                    self._file_cache[fn] = f.readlines()
-            except:
-                self._file_cache[fn] = []
-        
-        lines = self._file_cache[fn]
+        lines = self.get_file(fn)
         start_line = ext.start.line - 1  # 0-based index
         end_line = ext.end.line - 1      # 0-based index
         start_col = ext.start.column - 1 # 0-based index
@@ -452,7 +475,7 @@ class RepoAnalyzer(nx.DiGraph):
                 variants = self.base_name_variants(child.spelling)
                 matches = [
                     n for n, d in self.nodes(data=True)
-                    if d.get("kind") & NodeKind.FUNCTION and variants & self.base_name_variants(n)
+                    if is_kind(d.get("kind"), NodeKind.FUNCTION) and variants & self.base_name_variants(n)
                 ]
                 
                 if len(matches) == 1:
@@ -616,16 +639,6 @@ class RepoAnalyzer(nx.DiGraph):
         print(f"✅ Uber file generated at {output_file}")
         return output_file
 
-    def parse_uber_file(self, uber_file: Path) -> Optional[cindex.TranslationUnit]:
-        args = self.COMMON_COMPILER_ARGS + self.make_include_args(uber_file)
-        try:
-            return self.index.parse(str(uber_file), args=args,
-                            options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
-        except Exception as e:
-            print(f"❌ Failed to parse uber file: {e}")
-            return None
-
-
     def cpp_files(self) -> List[Path]:
         return [Path(dp) / f for dp, _, files in os.walk(self.repo_path) for f in files if f.endswith((".cpp", ".cc", ".cxx", ".c", ".hpp", ".h"))]
 
@@ -650,7 +663,7 @@ class RepoAnalyzer(nx.DiGraph):
                         self.add_edges_from(contracted.edges(data=True))
         # make all types who point to variables, point to the variables' succesors
         for n in list(self.nodes):
-            if self.nodes[n]["kind"] & NodeKind.TYPE:
+            if is_kind(self.nodes[n]["kind"], NodeKind.TYPE):
                 for succ in list(self.successors(n)):
                     if is_kind(self.nodes[succ]["kind"], NodeKind.VARIABLE):
                         for succ_succ in list(self.successors(succ)):
@@ -674,7 +687,7 @@ class RepoAnalyzer(nx.DiGraph):
 
         # Overrides (inherits + overrides)
         for u, v, data in self.edges(data=True):
-            if data.get("type") & EdgeType.INHERITS:
+            if is_kind(data.get("type"), EdgeType.INHERITS):
                 # u inherits from v
                 # if both u and v define a method with the same name
                 u_methods = {n for n in self.successors(u) if is_kind(self.nodes[n]['kind'], NodeKind.FUNCTION)}
@@ -747,6 +760,10 @@ class RepoAnalyzer(nx.DiGraph):
         self.clear()  
         uber_file = self.generate_uber_file()
         tu = self.parse_file(uber_file)
+        compile_proc = subprocess.Popen([
+            "clang++", "-O3", "-fsave-optimization-record", "-c",
+            str(uber_file), "-o", str(uber_file.with_suffix(".o"))
+        ])
         lib_subgraph_path = Path('/home/ayuram/pesquared/dumps') / "lib_subgraph.gpickle"
         # Check if we have a lib_subgraph.gpickle
         if not self.lib_subgraph and lib_subgraph_path.exists():
@@ -799,8 +816,8 @@ class RepoAnalyzer(nx.DiGraph):
                 tree = self.func_trees.setdefault(file, IntervalTree())
                 # intervaltree uses half-open intervals [begin, end)
                 tree[start:end+1] = fn
-        # Compile the code with missed optimization remarks using the command `clang++ -O2 -fsave-optimization-record -c `uber_file`.cpp -o `uber_file`.o`
-        subprocess.run(["clang++", "-O2", "-fsave-optimization-record", "-c", str(uber_file), "-o", str(uber_file.with_suffix(".o"))])
+        # Compile the code with missed optimization remarks using the command `clang++ -O3 -fsave-optimization-record -c `uber_file`.cpp -o `uber_file`.o`
+        compile_proc.communicate()
         self.parse_missed_optimizations(uber_file.with_suffix(".opt.yaml"))
         # Remove the uber file node
         if uber_file.name in self:
@@ -876,9 +893,14 @@ class RepoAnalyzer(nx.DiGraph):
             current_code = current_code.replace(self.nodes[function]["code"], code)
             f.write(current_code)
         # Update the node's code attribute
-        self.nodes[function]["code"] = code
-        self._file_cache[fn] = current_code.splitlines()
+        self.nodes[function]['code_branches'] = {f'{self.branch}': code}
+        self._file_cache[fn][self.branch] = current_code.splitlines()
         return fn
+    
+    def get_code(self, node: str):
+        if 'branches' not in self.nodes[node]:
+            return self.nodes[node]['code']
+        return self.nodes[node]['code_branches'][self.branch]
     
     def add_imports(self, fn: str, imports: str):
         """Add imports to the top of the file."""
@@ -888,7 +910,9 @@ class RepoAnalyzer(nx.DiGraph):
         with open(fn, "r") as f:
             code = f.read()
         with open(fn, "w") as f:
-            f.write(imports + "\n" + code)
+            code = imports + "\n" + code
+            f.write(code)
+        self._file_cache[fn][self.branch] = code.splitlines()
         return fn
 
     def add_objects(self, fn: str, objects: str):
@@ -915,7 +939,7 @@ class RepoAnalyzer(nx.DiGraph):
             f.writelines(updated_code)
         return fn
 
-    def write_to_makefile(self, field: str, value: str):
+    def write_to_makefile(self, field: str, value: str, append: bool = False):
         """Write to the Makefile."""
         makefile = self.repo_path / "Makefile"
         if not makefile.exists():
@@ -927,7 +951,11 @@ class RepoAnalyzer(nx.DiGraph):
         with open(makefile, "r") as f:
             for line in f:
                 if line.strip().startswith(f"{field} :="):
-                    lines.append(f"{field} := {value}\n")
+                    if append:
+                        current_value = line.split(":=", 1)[1].strip()
+                        lines.append(f"{field} := {current_value} {value}\n")
+                    else:
+                        lines.append(f"{field} := {value}\n")
                     updated = True
                 else:
                     lines.append(line)
@@ -941,6 +969,22 @@ class RepoAnalyzer(nx.DiGraph):
         self.add_makefile()
 
         return makefile
+    
+    def update(self, files: List[Path]):
+        """Update the subgraph which contain nodes in the given files"""
+        for file in files:
+            if not file.exists():
+                print(f"File {file} does not exist.")
+                continue
+            # Parse the file
+            tu = self.parse_file(file)
+            if not tu:
+                print(f"Failed to parse {file}")
+                continue
+            # Collect nodes and edges
+            self.collect_nodes(tu.cursor)
+            self.collect_edges(tu.cursor, None)
+        print(f"Rebuilt subgraph with {len(self.nodes)} nodes and {len(self.edges)} edges")
 
 
     def plot(self, horizontal=False, node_filter: Optional[callable] = None, edge_filter: Optional[callable] = None):

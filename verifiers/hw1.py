@@ -5,6 +5,7 @@ import json
 import logging
 from tabulate import tabulate
 from typing import Dict, Tuple, List
+import subprocess
 from utils import git_utils
 
 logger = logging.getLogger()
@@ -52,11 +53,12 @@ class APEHW1(PerformanceVerifier):
     def get_performance(self, branch="") -> Tuple[Dict, bool]:
         with git_utils.temp_checkout(branch, self.codebase_dir):
             # run and get output of performance generation script
-            perf_cmd = f'docker run --privileged -it -v ~/college/cs598ape/598APE-HW1:/host adiprerepa/598ape /bin/bash -c "cd /host && bash perfstatgen.sh -PEG"'
+            perf_cmd = f'(cd tmp/adiprerepa/cs598APE-hw1 && bash perfstatgen.sh -PEG && cd ../../..)'
             
             logger.debug(f"Running command: {perf_cmd}")
-
-            perf_output = os.popen(perf_cmd).read().strip()
+            # os.system(perf_cmd)
+            result = subprocess.run(perf_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            perf_output = result.stdout.decode(errors='replace').strip()
             logger.debug(f"perf_output: {perf_output}")
 
             perf = self.get_counters_from_directory(f"{self.codebase_dir}/perf")
@@ -182,7 +184,7 @@ class APEHW1(PerformanceVerifier):
     def tests_pass(self, branch="") -> bool:
         with git_utils.temp_checkout(branch, self.codebase_dir):
             output_dir = f"{self.codebase_dir}/output"
-            baseline_dir = f"{self.codebase_dir}/pesquared-baseline-output"
+            baseline_dir = f"{self.codebase_dir}/baseline-outputs"
             
             # Check if both directories exist
             if not os.path.exists(output_dir) or not os.path.exists(baseline_dir):

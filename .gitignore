@@ -6,3 +6,4 @@ venv/
 .vscode/
 tmp/
 dumps/
+optimization_results.csv

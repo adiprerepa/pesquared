@@ -72,8 +72,8 @@ class APEHW2(PerformanceVerifier):
     def get_performance(self, branch="") -> Tuple[Dict, bool]:
         with git_utils.temp_checkout(branch, self.codebase_dir):
             # Run perfreport.sh with -D flag (for diabetes dataset only)
-            perf_cmd = f'docker run --privileged -it -v ~/college/cs598ape/598APE-HW2:/host adiprerepa/598ape /bin/bash -c "cd /host && bash perfstatgen.sh -D"'
-            
+            # perf_cmd = f'docker run --privileged -it -v ~/cs598APE-hw2:/host adiprerepa/598ape /bin/bash -c "cd /host && bash perfstatgen.sh -D"'
+            perf_cmd = f"(cd {self.codebase_dir} && sudo bash perfstatgen.sh -D)"
             logger.debug(f"Running command: {perf_cmd}")
 
             perf_output = os.popen(perf_cmd).read().strip()
