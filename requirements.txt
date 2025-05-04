@@ -2,9 +2,6 @@ clang
 tiktoken
 pandas>=2.0.0
 lxml>=4.9.0
-openai>=1.0.0
-anthropic>=0.46.0
-google-generativeai
 gitpython>=3.1.0
 python-dotenv>=1.0.0
 tabulate
@@ -16,3 +13,13 @@ intervaltree
 cxxfilt
 nltk
 seaborn
+modal
+scipy
+langchain
+langchain-openai
+langchain-anthropic
+langchain-google-genai
+langgraph
+langchain_community
+numexpr
+langsmith
