@@ -4,4 +4,7 @@ venv/
 .env
 .idea/
 .vscode/
-
+tmp/
+dumps/
+*.csv
+*.png
