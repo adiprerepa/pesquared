@@ -4,6 +4,8 @@ from clang.cindex import CursorKind
 from typing import List, Set, Tuple, Dict
 from intervaltree import IntervalTree
 from dataclasses import dataclass
+from utils.graph_utils import DAGish
+from networkx.algorithms.dominance import immediate_dominators
 
 @dataclass(frozen=True)
 class Extent:
@@ -15,7 +17,7 @@ class Extent:
     def __str__(self) -> str:
         return f"{self.start_line}:{self.start_col}-{self.end_line}:{self.end_col}"
 
-class ControlFlowGraph(nx.DiGraph):
+class ControlFlowGraph(DAGish):
     def __init__(self, cursor: cindex.Cursor, file: List[str]):
         super().__init__()
         self.file = file
@@ -72,82 +74,10 @@ class ControlFlowGraph(nx.DiGraph):
             current = pred
         lines.append('entry')
         return '\n'.join(reversed(lines))
-
-    def plot_dag_horizontal_level(self,
-                                  node_size=1500,
-                                  font_size=10,
-                                  horiz_gap=1.5,
-                                  vert_gap=1.0,
-                                  keep_chars=3):
-        import matplotlib.pyplot as plt
-        from collections import deque, defaultdict
-
-        kind_colors = {
-            CursorKind.IF_STMT: 'lightblue',
-            CursorKind.FOR_STMT: 'lightgreen',
-            CursorKind.WHILE_STMT: 'lightcoral',
-            CursorKind.DO_STMT: 'gold',
-            CursorKind.SWITCH_STMT: 'violet',
-            CursorKind.RETURN_STMT: 'orange',
-        }
-
-        if nx.is_directed_acyclic_graph(self):
-            G_levels = self
-            node_to_scc = {n: n for n in self.nodes}
-        else:
-            print("Graph is not a DAG; using condensation.")
-            condensed = nx.condensation(self)
-            node_to_scc = condensed.graph['mapping']
-            G_levels = condensed
-
-        roots = [n for n, d in G_levels.in_degree() if d == 0]
-        if not roots:
-            raise ValueError("Graph has no roots; not a DAG or empty.")
-
-        level = {}
-        dq = deque()
-        for r in roots:
-            level[r] = 0
-            dq.append(r)
-        while dq:
-            u = dq.popleft()
-            for v in G_levels.successors(u):
-                lvl = level[u] + 1
-                if v not in level or lvl < level[v]:
-                    level[v] = lvl
-                    dq.append(v)
-
-        groups = defaultdict(list)
-        for n in self.nodes:
-            l = level.get(node_to_scc.get(n, n), 0)
-            groups[l].append(n)
-
-        pos = {}
-        for l, nodes in groups.items():
-            mid = (len(nodes) - 1) / 2.0
-            for i, n in enumerate(nodes):
-                pos[n] = (l * horiz_gap, (mid - i) * vert_gap)
-
-        labels = {n: self.truncate_label(str(self.nodes[n].get('label', n)), keep_chars)
-                  for n in self.nodes}
-        node_colors = [kind_colors.get(self.nodes[n].get('kind'), 'gray') for n in self.nodes]
-
-        plt.figure(figsize=(12, 8))
-        nx.draw(self, pos,
-                labels=labels,
-                with_labels=True,
-                node_size=node_size,
-                font_size=font_size,
-                arrows=True,
-                edge_color='gray',
-                node_color=node_colors,
-                connectionstyle='arc3,rad=0.2')
-        plt.axis('off')
-        plt.show()
     
     def _get_or_create_line_node(self, line: int) -> str:
         if line not in self._line_to_node:
-            label = self.file[line - 1].strip()  # Whole line text
+            label = self.file[line - 1].strip()
             node_id = f"line_{line}"
             self.add_node(node_id, label=label, extent=None)
             ext = Extent(line, 1, line, len(label) + 1)
@@ -299,7 +229,6 @@ class ControlFlowGraph(nx.DiGraph):
         return complexity
 
     def compute_dominator_tree(self, start: str = '__entry__') -> nx.DiGraph:
-        from networkx.algorithms.dominance import immediate_dominators
         idoms = immediate_dominators(self, start)
         dom_tree = nx.DiGraph()
         for node, idom in idoms.items():

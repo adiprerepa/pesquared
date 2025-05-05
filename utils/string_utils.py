@@ -104,41 +104,56 @@ class FuzzyDict(dict):
             return default
 
 
-def extract_markdown_blocks(text: str, returnLanguage: bool = False) -> list:
+def extract_markdown_blocks(text: str) -> list:
     """
     Extract markdown blocks from a string.
 
     Returns a list of the code/text inside ```...``` fences.
     """
     pattern = re.compile(r"```(?:[\w+\-]*)\n(.*?)```", re.DOTALL)
-    language = re.compile(r"^```([\w+\-]*)\n", re.MULTILINE)
-    if returnLanguage:
-        matches = pattern.findall(text)
-        languages = language.findall(text)
-        return [(m.strip(), l) for m, l in zip(matches, languages)]
     return [m.strip() for m in pattern.findall(text)]
 
 
-def markdown_to_dict(markdown: str) -> dict:
-    """
-    Parse a markdown document into a dict of {header: content}.
-    Headers are normalized to lowercase.
-    """
-    header_regex = re.compile(r'^(#+)\s*(.*)', re.MULTILINE)
-    result = defaultdict(str)
+def markdown_to_dict(markdown_text):
+    lines = markdown_text.strip().splitlines()
+    result = {}
+    current_h1 = None
+    current_h2 = None
+    temp_storage = {}
+    temp_content = ''
 
-    headers = [(m.group(1).count('#'), m.group(2), m.start()) 
-               for m in header_regex.finditer(markdown)]
-    headers.sort(key=lambda x: x[2])
+    for line in lines:
+        line = line.strip()
+        if line.startswith('# '):
+            if current_h1:
+                if temp_storage:
+                    result[current_h1.lower().strip()] = temp_storage
+                elif temp_content:
+                    result[current_h1.lower().strip()] = temp_content.strip()
+            current_h1 = line[2:].strip()
+            temp_storage = {}
+            temp_content = ''
+            current_h2 = None
+        elif line.startswith('## '):
+            current_h2 = line[3:].strip()
+            temp_storage[current_h2.lower().strip()] = ''
+        else:
+            if current_h2:
+                if temp_storage[current_h2.lower().strip()]:
+                    temp_storage[current_h2.lower().strip()] += ' ' + line
+                else:
+                    temp_storage[current_h2.lower().strip()] = line
+            elif current_h1:
+                temp_content += ' ' + line
 
-    for i, (level, title, start) in enumerate(headers):
-        end = headers[i+1][2] if i+1 < len(headers) else len(markdown)
-        # slice out everything between the end of this header line and the next header
-        content_start = start + len(title) + level + 1
-        content = markdown[content_start:end].strip()
-        result[title.lower()] = content
+    # Save the last block
+    if current_h1:
+        if temp_storage:
+            result[current_h1.lower().strip()] = temp_storage
+        elif temp_content:
+            result[current_h1.lower().strip()] = temp_content.strip()
 
-    return FuzzyDict(result)
+    return result
 
 def wordwise_tokenize(text):
     """Tokenizes a sequence into words, punctuation, and whitespace

@@ -16,40 +16,35 @@ Write a detailed, step by step outline of the algorithm as a numbered list.
 ALGORITHM_BOTTLENECK_PROMPT = PromptTemplate(
     input_variables=["function_name", "code", "steps"],
     template="""
-You are a performance engineer. Analyze the following algorithm {function_name} for bottlenecks.
+You are a performance engineer. Analyze the following hot path in {function_name} for bottlenecks.
 
-{steps}
+{code}
 
 We will optimize this step by step.
 
 Structure your response as follows:
 
 # Bottleneck Insights
-<List out the function's top 3 bottleneck steps IN REVERSE (don't worry about how to fix just yet)> <the bottlenecks should be MEMBERS of `{function_name}` and NOT `{function_name}` itself>
+<List out the function's top bottleneck step (don't worry about how to fix just yet)>
 ## Bottleneck `NAME`:
 <1 sentence description of step `NAME`>
 ### Dependants
 Fill in the following VERBATIM (filling in for the `variables` by their semantic meaning):
-The outputs from `NAME` are DIRECTLY utilized by the future steps 
-- `future step 1`
-- `future step 2`
+The outputs from `NAME` are DIRECTLY utilized by the future steps (provide code snippet as well as semantic meaning): 
+- `A`
+- `B`
 -  ...
-### Semantic Union to Find Commonly Held Value (X)
-First write the following: "I will now perform the semantic union: `future step 1` \cup `future step 2` \cup ... = *`X`*"
-`NAME` is valuable because it provides the valuable information of *`X`* to [`future step 1`, `future step 2`, ...].
-### Thinking from the Dependants Perspective
-Fill in the following VERBATIM (ignoring all context in this repo):
-'if I JUST needed *`X`* information and NOTHING else, and I knew NOTHING of this codebase, and *`X`* was ALL I needed, the FASTEST and MOST NAIVE way to get *`X`* would be to perform *`Y`*'.
-#### Comparison of *`Y`* and *`NAME`*
-Fill in the following: "Question: is *`Y`* is roughly the same as *`NAME`*? Answer: `YES/NO`"
-If NO: then write the following:
+### Analysis of the Utilization of `NAME`
+First, write the following: "In the abstract, performing `NAME` is useful because it provides ..."
+Then, analyze what information from `NAME` is ACTUALLY being used by `A`, `B`, ...:
+<your analysis here>
+If there exists a `BETTER_METHOD` to perform which yields the same information as `NAME` but is faster, then write:
 #### NOTE to SELF
-'Consider changing *`NAME`* to *`Y`*'
+'Consider changing *`NAME`* to *`BETTER_METHOD`*'
 Else:
 #### Nothing here to optimize
 N/A
-
-## Do the same for the other 2 bottlenecks
+```
 """
 )
 

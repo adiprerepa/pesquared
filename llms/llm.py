@@ -1,5 +1,7 @@
 import os
 from typing import Optional, List, Dict, Any
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain, SequentialChain
 
 # Import necessary LangChain components
 from langchain_core.language_models import BaseChatModel
@@ -10,11 +12,10 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-
 class UniversalLLM:
     """
     A universal wrapper for various LLM providers using LangChain.
-    Supports OpenAI, Anthropic (Claude), Google Generative AI (Gemini), and custom vLLM.
+    Supports GPT (OpenAI), Claude (Anthropic), Gemini (Google), LLaMa (Meta), and custom vLLM servers.
     """
     
     def __init__(
@@ -30,7 +31,7 @@ class UniversalLLM:
         
         Args:
             model: The name of the model to use
-            provider: The provider of the model (openai, anthropic, gemini, vllm)
+            provider: The provider of the model (openai, anthropic, google, meta, vllm)
             temperature: The temperature for generation (default: 0.7)
             max_tokens: The maximum number of tokens to generate (optional)
             **kwargs: Additional arguments to pass to the model
@@ -93,10 +94,21 @@ class UniversalLLM:
                     params["max_output_tokens"] = self.max_tokens
                 
                 return ChatGoogleGenerativeAI(**params, **self.kwargs)
+            
+            elif self.provider == "meta":
+                base_url = "https://api.llama.com/compat/v1/"
+                return ChatOpenAI(
+                    model=self.model,
+                    temperature=temp,
+                    max_tokens=self.max_tokens,
+                    openai_api_key=self.api_key,
+                    openai_api_base=base_url,
+                    **self.kwargs
+                )
                 
-            elif self.provider == "modal":
+            elif self.provider == "vllm":
                 # Assuming vLLM is running with an OpenAI-compatible API
-                base_url = os.getenv("MODAL_API_BASE", "http://localhost:8000/v1")
+                base_url = os.getenv("VLLM_API_BASE", "http://localhost:8000/v1")
                 
                 params = {
                     "model": self.model,
@@ -219,3 +231,69 @@ class UniversalLLM:
             return response.content
         except Exception as e:
             raise ValueError(f"Error generating async response: {str(e)}")
+    
+    def load_prompt_template(
+        self,
+        template: str,
+        input_variables: List[str],
+    ) -> PromptTemplate:
+        """
+        Create and return a LangChain PromptTemplate.
+
+        Args:
+            template: The prompt text with {placeholders}
+            input_variables: The variables used in the template
+
+        Returns:
+            A PromptTemplate instance
+        """
+        return PromptTemplate(
+            template=template,
+            input_variables=input_variables
+        )
+
+    def run_chain(
+        self,
+        prompt_template: PromptTemplate,
+        inputs: Dict[str, Any],
+        temperature: Optional[float] = None
+    ) -> str:
+        """
+        Run a single prompt template using LLMChain.
+
+        Args:
+            prompt_template: A PromptTemplate object
+            inputs: A dictionary of input variables for the prompt
+            temperature: Optional temperature override
+
+        Returns:
+            The LLM's response as a string
+        """
+        llm = self._initialize_llm(temperature) if temperature else self.llm
+        chain = LLMChain(llm=llm, prompt=prompt_template)
+        return chain.run(inputs)
+
+    def run_multi_chain(
+        self,
+        chains: List[LLMChain],
+        inputs: Dict[str, Any],
+        output_variables: List[str]
+    ) -> Dict[str, str]:
+        """
+        Run a SequentialChain composed of multiple LLMChains.
+
+        Args:
+            chains: A list of LLMChain instances
+            inputs: The input dictionary
+            output_variables: The expected outputs from the final chain
+
+        Returns:
+            A dictionary of outputs
+        """
+        seq = SequentialChain(
+            chains=chains,
+            input_variables=list(inputs.keys()),
+            output_variables=output_variables,
+            verbose=True
+        )
+        return seq.invoke(inputs)

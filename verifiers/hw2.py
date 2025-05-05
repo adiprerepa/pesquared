@@ -5,7 +5,12 @@ import logging
 from tabulate import tabulate
 from typing import Dict, Tuple, List
 from utils import git_utils
-from analyzers.clang_remark_analyzer import OptimizationRemark, parse_optimization_summary
+# from analyzers.clang_remark_analyzer import OptimizationRemark, parse_optimization_summary
+import subprocess
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from tqdm import tqdm
 
 logger = logging.getLogger()
 class APEHW2(PerformanceVerifier):
@@ -25,7 +30,7 @@ class APEHW2(PerformanceVerifier):
                     try:
                         data = json.loads(line.strip())
                         if "event" in data and "counter-value" in data:
-                            event_map[data["event"]] = data["counter-value"]
+                            event_map[data["event"]] = float(data["counter-value"])
                     except json.JSONDecodeError:
                         continue
             
@@ -46,55 +51,189 @@ class APEHW2(PerformanceVerifier):
                 result[subdir_name] = self.get_counter_value(file_path)
         return result
 
-    def get_remarks(self, branch="") -> List[OptimizationRemark]:
+    def get_remarks(self, branch="") -> List[str]:
         with git_utils.temp_checkout(branch, self.codebase_dir):
-            gen_remark_cmd = f'docker run --privileged -it -v ~/college/cs598ape/598APE-HW2:/host adiprerepa/598ape /bin/bash -c "cd /host && make clean && make"'
+            gen_remark_cmd = f"""
+                pushd {self.codebase_dir} >/dev/null
+                make clean && make
+                popd >/dev/null
+            """
             logger.debug(f"Running command (to generate remarks): {gen_remark_cmd}")
-            gen_remark_output = os.popen(gen_remark_cmd).read().strip()
-            logger.debug(f"gen_remark_output: {gen_remark_output}")
+            result = subprocess.run(
+                gen_remark_cmd,
+                shell=True,
+                executable='/bin/bash',
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            logger.debug(f"gen_remark_output:\n{result.stdout}")
+            if result.returncode != 0:
+                logger.error(f"Build failed with error:\n{result.stderr}")
 
-            remarks_cmd = f"python3 scripts/parse_clang_remarks.py -o {self.codebase_dir}/missed_remarks_tmp.yaml {self.codebase_dir}/obj"
-            logger.debug(f"Running command (to parse remarks): {remarks_cmd}")
-            remarks_output = os.popen(remarks_cmd).read().strip()
-            logger.debug(f"remarks_output: {remarks_output}")
+            yaml_contents = []
+            for root, _, files in os.walk(self.codebase_dir):  # <-- search everything under codebase_dir
+                for file in files:
+                    if file.endswith(".opt.yaml"):
+                        yaml_path = os.path.join(root, file)
+                        try:
+                            with open(yaml_path, 'r') as f:
+                                yaml_contents.append(f.read())
+                        except Exception as e:
+                            logger.warning(f"Could not read {yaml_path}: {e}")
 
-            remarks = parse_optimization_summary(f"{self.codebase_dir}/missed_remarks_tmp.yaml")
-            logger.debug(f"got {len(remarks)} remarks")
+            logger.debug(f"Found {len(yaml_contents)} .opt.yaml files")
 
             os.system(f'sudo rm -rf {self.codebase_dir}/obj')
-            os.system(f'sudo rm {self.codebase_dir}/missed_remarks_tmp.yaml')
 
-            # Reset hard before returning to original branch
             if branch:
                 git_utils.reset_hard(self.codebase_dir)
-            return remarks
+
+            return yaml_contents
+
     
-    def get_performance(self, branch="") -> Tuple[Dict, bool]:
+    def get_performance(self, branch="", n_iters=1, fn_list=[]) -> Tuple[Dict, bool]:
         with git_utils.temp_checkout(branch, self.codebase_dir):
-            # Run perfreport.sh with -D flag (for diabetes dataset only)
-            # perf_cmd = f'docker run --privileged -it -v ~/cs598APE-hw2:/host adiprerepa/598ape /bin/bash -c "cd /host && bash perfstatgen.sh -D"'
-            perf_cmd = f"(cd {self.codebase_dir} && sudo bash perfstatgen.sh -D)"
-            logger.debug(f"Running command: {perf_cmd}")
+            perf_cmd = f"""
+                pushd {self.codebase_dir} >/dev/null
+                taskset -c 10 bash perfstatgen.sh -D
+                popd >/dev/null
+            """
 
-            perf_output = os.popen(perf_cmd).read().strip()
-            logger.debug(f"perf_output: {perf_output}")
+            agg_perf = None
+            for i in range(n_iters):
+                logger.debug(f"Running command:\n{perf_cmd}")
+                result = subprocess.run(
+                    perf_cmd,
+                    shell=True,
+                    executable="/bin/bash",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                perf_output = result.stdout.strip()
+                logger.debug(f"perf_output:\n{perf_output}")
+                if result.returncode != 0:
+                    logger.error(f"perfstatgen.sh failed:\n{result.stderr}")
+                    return {}, False
 
-            perf = self.get_counters_from_directory(f"{self.codebase_dir}/perf")
+                perf = self.get_counters_from_directory(f"{self.codebase_dir}/perf")
+                tests_passed = self.tests_pass()
 
-            tests_passed = self.tests_pass()
+                if not tests_passed:
+                    logger.error(f"Tests failed for branch {branch} after iteration {i+1}")
+                    return perf, tests_passed
 
-            remarks_cmd = f"python3 scripts/parse_clang_remarks.py -o {self.codebase_dir}/missed_remarks_tmp.yaml {self.codebase_dir}/obj/"
+                if self.validate_performance(perf):
+                    if agg_perf is None:
+                        agg_perf = perf
+                    else:
+                        for k in agg_perf:
+                            for k2 in agg_perf[k]:
+                                if k2 in perf[k]:
+                                    agg_perf[k][k2] = min(agg_perf[k][k2], perf[k][k2])
 
-            os.system(f'sudo rm -rf {self.codebase_dir}/perf')
-            os.system(f'sudo rm -rf {self.codebase_dir}/obj')
-            os.system(f'sudo rm {self.codebase_dir}/missed_remarks_tmp.yaml')
-            
-            # Reset hard before returning to original branch
+                    # Process target function counters
+                    for fn in fn_list:
+                        for k in agg_perf:
+                            if "target_fns" not in agg_perf[k]:
+                                agg_perf[k]["target_fns"] = {}
+                            fn_counter = self.get_counters_for_function_from_directory(
+                                f"{self.codebase_dir}/perf/{k}", fn
+                            )
+                            if fn not in agg_perf[k]["target_fns"]:
+                                agg_perf[k]["target_fns"][fn] = fn_counter
+                            else:
+                                agg_perf[k]["target_fns"][fn] = min(agg_perf[k]["target_fns"][fn], fn_counter)
+
+                os.system(f'sudo rm -rf {self.codebase_dir}/perf')
+
             if branch:
-                git_utils.reset_hard(self.codebase_dir)
-            
-            return perf, tests_passed
-    
+                os.system(f'git -C {self.codebase_dir} stash -q')
+
+            return agg_perf, tests_passed
+        
+    def get_all_performance_parallel(self, branches: List[str], n_iters=1, fn="") -> Dict[str, Dict]:
+        all_perf_data = {}
+        dump_dirs = {}
+
+        # Step 1: Prepare all dumps (normal copy since repos are small)
+        for branch in branches:
+            with git_utils.temp_checkout(branch, self.codebase_dir):
+                dump_dir = f'/home/ayuram/pesquared/dumps/{branch}'
+                if os.path.exists(dump_dir):
+                    shutil.rmtree(dump_dir)
+                shutil.copytree(self.codebase_dir, dump_dir)
+                dump_dirs[branch] = dump_dir
+
+        # Step 2: Setup CPU core partitioning
+        total_cores = multiprocessing.cpu_count() * (2/3) # 2/3 of the cores
+        max_parallel = total_cores
+
+        logger.info(f"Total cores: {total_cores}, max parallel branches: {max_parallel}")
+
+        # Step 3: Define the perf runner
+        def run_perf(branch_id, branch, dump_dir):
+            start_core = branch_id
+            agg_perf = None
+            successful_iters = 0
+            one_test_passed = False
+            for i in range(n_iters):
+                perf_cmd = f'taskset -c {start_core} bash perfstatgen.sh -D'
+                full_cmd = f'(pushd {dump_dir} >/dev/null && {perf_cmd} ; popd >/dev/null)'
+                logger.debug(f"Running command for {branch}: {full_cmd}")
+
+                result = subprocess.run(['bash', '-c', full_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                if result.returncode != 0:
+                    logger.error(f"perfstatgen.sh failed for branch {branch}: {result.stderr.decode(errors="replace")}")
+                    return branch, None, False
+
+                perf_output = result.stdout.decode(errors="replace").strip()
+                logger.debug(f"perf_output for {branch} (iter {i}): {perf_output}")
+
+                perf = self.get_counters_from_directory(f"{dump_dir}/perf")
+                if fn != "":
+                    for k in perf:
+                        perf[k]["target_fn_cycles"] = self.get_counters_for_function_from_directory(f"{dump_dir}/perf/{k}", fn)
+                tests_passed = self.tests_pass()
+                if tests_passed and self.validate_performance(perf):
+                    one_test_passed = True
+                    successful_iters += 1
+                    if agg_perf is None:
+                        agg_perf = perf
+                    else:
+                        for k in agg_perf:
+                            for k2 in agg_perf[k]:
+                                if k2 in perf[k]:
+                                    agg_perf[k][k2] = min(agg_perf[k][k2], float(perf[k][k2]))
+                                    # agg_perf[k][k2] += float(perf[k][k2])
+            # if agg_perf is not None:
+            #     for k in agg_perf:
+            #         for k2 in agg_perf[k]:
+            #             agg_perf[k][k2] /= successful_iters
+                    # os.system(f'sudo rm -rf {dump_dir}/perf')
+
+            return branch, agg_perf, one_test_passed
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=min(max_parallel, len(branches))) as executor:
+            for idx, (branch, dump_dir) in enumerate(dump_dirs.items()):
+                futures.append(executor.submit(run_perf, idx, branch, dump_dir))
+                logger.info(f"Submitted perf job {branch} with core {idx}")
+
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Running perf jobs"):
+                branch, perf, tests_passed = future.result()
+                if perf is not None:
+                    all_perf_data[branch] = perf
+                    all_perf_data[branch]['tests_passed'] = tests_passed
+
+        # Step 5: Clean up
+        for branch, dump_dir in dump_dirs.items():
+            if os.path.exists(dump_dir):
+                shutil.rmtree(dump_dir)
+
+        return all_perf_data
 
     def validate_performance(self, perf: dict) -> bool:
         """

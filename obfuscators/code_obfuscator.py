@@ -17,13 +17,14 @@ class CodeObfuscator:
     _CURSOR_KINDS_BY_TIER: Dict[int, Set[CursorKind]] = {
         2: {  # Variable names (user-defined)
             CursorKind.VAR_DECL,
-            CursorKind.PARM_DECL,
+            # CursorKind.PARM_DECL,
             CursorKind.FIELD_DECL,
+            CursorKind.VARIABLE_REF,
             CursorKind.ENUM_CONSTANT_DECL,
             CursorKind.MACRO_INSTANTIATION,
             CursorKind.MACRO_DEFINITION,
             CursorKind.MEMBER_REF_EXPR,
-            CursorKind.DECL_REF_EXPR,
+            # CursorKind.DECL_REF_EXPR,
         },
         3: {  # Add user-defined functions & class names
             CursorKind.FUNCTION_DECL,

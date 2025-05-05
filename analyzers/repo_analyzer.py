@@ -1,10 +1,6 @@
-import bisect
 import os
-import shutil
 import subprocess
 from pathlib import Path
-import tempfile
-import pydot
 from typing import Optional, List, Dict, Set, Tuple, Union
 import re
 import networkx as nx
@@ -12,91 +8,20 @@ import matplotlib.pyplot as plt
 from collections import OrderedDict, defaultdict
 from clang import cindex
 import yaml
+from analyzers.function_slicer import FunctionSlicer
 from utils.cursor_utils import loc_info, CTOR_KINDS, FUNC_KINDS, TYPE_KINDS, TEMPLATE_PARAM_KINDS, MEMBER_KINDS, GLOBAL_KINDS
 from utils.git_utils import clone_repo, get_current_branch
 import pickle
 from analyzers.stack_analyzer import StackAnalyzer, FunctionStats
 from intervaltree import IntervalTree
+from analyzers.kinds import NodeKind, EdgeType, is_kind, is_function, is_variable, in_repo_and_not_variable
+from utils.graph_utils import DAGish
+from verifiers.base_verifier import PerformanceVerifier
 
 _CLANG_INITIALIZED = False
 
-from enum import IntFlag
-
-class NodeKind(IntFlag):
-    # Base categories
-    UNKNOWN = 0
-    FUNCTION = 1 << 0
-    VARIABLE = 1 << 1
-    TYPE = 1 << 2
-
-    # Subcategories embed their base bit
-    CONSTRUCTOR = FUNCTION | (1 << 3)
-    DESTRUCTOR = FUNCTION | (1 << 4)
-    METHOD = FUNCTION | (1 << 5)
-    FREE_FUNCTION = FUNCTION | (1 << 6)
-
-    MEMBER_VAR = VARIABLE | (1 << 7)
-    GLOBAL_VAR = VARIABLE | (1 << 8)
-    LOCAL_VAR = VARIABLE | (1 << 9)
-
-    CLASS = TYPE | (1 << 10)
-    STRUCT = TYPE | (1 << 11)
-    ENUM = TYPE | (1 << 12)
-    TYPEDEF = TYPE | (1 << 13)
-    TEMPLATE = TYPE | (1 << 14)
-
-    # Origin modifiers
-    IN_CODEBASE = 1 << 24
-    LIBRARY = 1 << 25
-
-
-class EdgeType(IntFlag):
-    # Base categories
-    UNKNOWN = 0
-    CALL = 1 << 0       # 1 - Function/method calls
-    REFERENCE = 1 << 1  # 2 - References to entities
-    DEPENDENCY = 1 << 2 # 4 - Type dependencies
-    
-    # Call subcategories
-    FUNCTION_CALL = CALL | (1 << 4)      # 17
-    METHOD_CALL = CALL | (1 << 5)        # 33
-    CONSTRUCTOR_CALL = CALL | (1 << 6)   # 65
-    DESTRUCTOR_CALL = CALL | (1 << 7)    # 129
-    
-    # Reference subcategories
-    FUNCTION_REF = REFERENCE | (1 << 8)  # 258
-    MEMBER_REF = REFERENCE | (1 << 9)    # 514
-    GLOBAL_REF = REFERENCE | (1 << 10)   # 1026
-    TYPE_REF = DEPENDENCY | (1 << 11)    # 2052
-    NAMESPACE_REF = REFERENCE | (1 << 12) # 4098
-
-    # Inheritance
-    INHERITS = TYPE_REF | 1 << 13   # Inheritance relationship
-    
-    # Additional properties
-    DIRECT = 1 << 24    # Direct reference in source
-    INDIRECT = 1 << 25  # Indirect reference (e.g., via typedef)
-
-def is_kind(node, kind):
-    return (node & kind) == kind
-
-def in_repo_and_not_variable(node, attr):
-    return is_kind(attr['kind'], NodeKind.IN_CODEBASE) and not is_kind(attr['kind'], NodeKind.VARIABLE)
-
-def in_repo(node, attr):
-    return is_kind(attr['kind'], NodeKind.IN_CODEBASE)
-
-def is_function(node, attr):
-    return is_kind(attr['kind'], NodeKind.FUNCTION)
-
-def is_variable(node, attr):
-    return is_kind(attr['kind'], NodeKind.VARIABLE)
-
-def is_type(node, attr):
-    return is_kind(attr['kind'], NodeKind.TYPE)
-
-class RepoAnalyzer(nx.DiGraph):
-    def __init__(self, url: str, branch: str):
+class RepoAnalyzer(DAGish):
+    def __init__(self, url: str, branch: str, pv: PerformanceVerifier=None):
         """Initialize the RepoAnalyzer with a repository URL and branch."""
         super().__init__()
         repo = clone_repo(url, branch)
@@ -105,10 +30,10 @@ class RepoAnalyzer(nx.DiGraph):
         self._file_range_queries: Dict[str, IntervalTree] = {}
         self._init_clang()
         self.index = cindex.Index.create()
-        self.lib_subgraph : Optional[nx.DiGraph] = None
+        self.lib_subgraph: Optional[nx.DiGraph] = None
         self.symbol_to_signatures: Dict[str, List[str]] = defaultdict(list)
-        # find a directory containing only .folded files
         self.perfstacks_dir = None
+        self.pv = pv
         for dp, _, files in os.walk(self.repo_path):
             if all(f.endswith('.folded') for f in files) and len(files) > 0:
                 self.perfstacks_dir = Path(dp)
@@ -116,7 +41,7 @@ class RepoAnalyzer(nx.DiGraph):
         self._build_graph()
 
     @classmethod
-    def from_path(cls, path: str):
+    def from_path(cls, path: str, pv=None):
         """Initialize the RepoAnalyzer with an existing directory path."""
         instance = cls.__new__(cls)
         super(RepoAnalyzer, instance).__init__()
@@ -127,8 +52,8 @@ class RepoAnalyzer(nx.DiGraph):
         instance.index = cindex.Index.create()
         instance.lib_subgraph = None
         instance.symbol_to_signatures = defaultdict(list)
-        # find a directory containing only .folded files
         instance.perfstacks_dir = None
+        instance.pv = pv
         for dp, _, files in os.walk(instance.repo_path):
             if all(f.endswith('.folded') for f in files) and len(files) > 0:
                 instance.perfstacks_dir = Path(dp)
@@ -218,7 +143,7 @@ class RepoAnalyzer(nx.DiGraph):
         return self.demangle(n) if self.is_mangled(n) else n
     
     def get_file(self, file_name: str):
-        """Get the file name from the cache or read it from disk."""
+        """Get the file from the cache or read it from disk."""
         if file_name not in self._file_cache:
             try:
                 with open(file_name, 'r', encoding='utf-8', errors='ignore') as f:
@@ -318,6 +243,10 @@ class RepoAnalyzer(nx.DiGraph):
         if kind != NodeKind.UNKNOWN and name:
             self.add_node_to_graph(name, kind, cursor)
 
+        # Skip library nodes for now
+        # if is_kind(kind, NodeKind.LIBRARY):
+        #     return
+
         # Recursively process children
         for child in cursor.get_children():
             self.collect_nodes(child)
@@ -346,6 +275,7 @@ class RepoAnalyzer(nx.DiGraph):
                 attrs["cursor"] = cursor
                 attrs['start_line'] = cursor.extent.start.line
                 attrs['end_line'] = cursor.extent.end.line
+                attrs['label'] = name.split('(')[0]
 
             self.add_node(name, **attrs)
 
@@ -635,6 +565,9 @@ class RepoAnalyzer(nx.DiGraph):
                     includes.append(line)
 
         content = "// AUTO-GENERATED UBER FILE\n" + "\n".join(sorted(includes)) + "\n"
+        # check if the output file exists'
+        if not output_file.exists():
+            output_file.touch()
         output_file.write_text(content)
         print(f"✅ Uber file generated at {output_file}")
         return output_file
@@ -656,7 +589,6 @@ class RepoAnalyzer(nx.DiGraph):
                 if len(set(split)) == 1:
                     base = split[-1]
                     if base in self.nodes:
-                        # print(f"Merging node {base} into {n}")
                         contracted = nx.contracted_nodes(nx.DiGraph(self), n, base, self_loops=False)
                         self.clear()
                         self.add_nodes_from(contracted.nodes(data=True))
@@ -760,11 +692,14 @@ class RepoAnalyzer(nx.DiGraph):
         self.clear()  
         uber_file = self.generate_uber_file()
         tu = self.parse_file(uber_file)
-        compile_proc = subprocess.Popen([
-            "clang++", "-O3", "-fsave-optimization-record", "-c",
-            str(uber_file), "-o", str(uber_file.with_suffix(".o"))
-        ])
-        lib_subgraph_path = Path('/home/ayuram/pesquared/dumps') / "lib_subgraph.gpickle"
+        # compile_proc = subprocess.Popen([
+        #     "clang++", "-O3", "-fsave-optimization-record", "-c",
+        #     str(uber_file), "-o", str(uber_file.with_suffix(".o"))
+        # ])
+        # Create a machine-agnostic path for caching library subgraphs
+        cache_dir = Path.home() / ".pesquared" / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        lib_subgraph_path = cache_dir / "lib_subgraph.gpickle"
         # Check if we have a lib_subgraph.gpickle
         if not self.lib_subgraph and lib_subgraph_path.exists():
             with open(lib_subgraph_path, "rb") as f:
@@ -789,7 +724,6 @@ class RepoAnalyzer(nx.DiGraph):
                 tree = self.func_trees.setdefault(file, IntervalTree())
                 # intervaltree uses half-open intervals [begin, end)
                 tree[start:end+1] = fn
-        # self._build_control_flow_graphs()
         self._close_graph()
         if not self.lib_subgraph:
             # store the subgraph of library nodes on disk
@@ -812,21 +746,24 @@ class RepoAnalyzer(nx.DiGraph):
         for fn, attrs in self.nodes(data=True):
             if is_kind(attrs['kind'], NodeKind.FUNCTION) and is_kind(attrs['kind'], NodeKind.IN_CODEBASE):
                 file = attrs['file']
+                attrs['slicer'] = FunctionSlicer(attrs['cursor'], self.get_file(file))
                 start, end = attrs['start_line'], attrs['end_line']
                 tree = self.func_trees.setdefault(file, IntervalTree())
                 # intervaltree uses half-open intervals [begin, end)
                 tree[start:end+1] = fn
         # Compile the code with missed optimization remarks using the command `clang++ -O3 -fsave-optimization-record -c `uber_file`.cpp -o `uber_file`.o`
-        compile_proc.communicate()
-        self.parse_missed_optimizations(uber_file.with_suffix(".opt.yaml"))
+        # compile_proc.communicate()
+
+        yaml_contents = self.pv.get_remarks()
+        self.parse_missed_optimizations(yaml_contents_list=yaml_contents)
         # Remove the uber file node
         if uber_file.name in self:
             self.remove_node(uber_file.name)
         # Delete the uber file
         try:
             os.remove(uber_file)
-            os.remove(uber_file.with_suffix(".o"))
-            os.remove(uber_file.with_suffix(".opt.yaml"))
+            # os.remove(uber_file.with_suffix(".o"))
+            # os.remove(uber_file.with_suffix(".opt.yaml"))
         except Exception as e:
             print(f"❌ Failed to remove uber file: {e}")
     
@@ -987,271 +924,100 @@ class RepoAnalyzer(nx.DiGraph):
         print(f"Rebuilt subgraph with {len(self.nodes)} nodes and {len(self.edges)} edges")
 
 
-    def plot(self, horizontal=False, node_filter: Optional[callable] = None, edge_filter: Optional[callable] = None):
-        filtered_graph = self.induce_subgraph(node_filter, edge_filter)
+    # def plot(self, horizontal=False, node_filter: Optional[callable] = None, edge_filter: Optional[callable] = None):
+    #     filtered_graph = self.induce_subgraph(node_filter, edge_filter)
 
-        # --- Level Computation ---
-        levels = {}
+    #     # --- Level Computation ---
+    #     levels = {}
 
-        if nx.is_directed_acyclic_graph(filtered_graph):
-            # Regular topological sort
-            for node in nx.topological_sort(filtered_graph):
-                preds = list(filtered_graph.predecessors(node))
-                levels[node] = 0 if not preds else 1 + max(levels[p] for p in preds)
-        else:
-            print("⚠️ Graph is not a DAG. Using SCC condensation for level estimation.")
-            cycle = list(nx.simple_cycles(filtered_graph))
-            if cycle:
-                print(f"⚠️ Found cycles: {cycle}")
-            sccs = list(nx.strongly_connected_components(filtered_graph))
-            scc_map = {node: idx for idx, comp in enumerate(sccs) for node in comp}
-            condensed = nx.condensation(filtered_graph, sccs)
+    #     if nx.is_directed_acyclic_graph(filtered_graph):
+    #         # Regular topological sort
+    #         for node in nx.topological_sort(filtered_graph):
+    #             preds = list(filtered_graph.predecessors(node))
+    #             levels[node] = 0 if not preds else 1 + max(levels[p] for p in preds)
+    #     else:
+    #         print("⚠️ Graph is not a DAG. Using SCC condensation for level estimation.")
+    #         cycle = list(nx.simple_cycles(filtered_graph))
+    #         if cycle:
+    #             print(f"⚠️ Found cycles: {cycle}")
+    #         sccs = list(nx.strongly_connected_components(filtered_graph))
+    #         scc_map = {node: idx for idx, comp in enumerate(sccs) for node in comp}
+    #         condensed = nx.condensation(filtered_graph, sccs)
 
-            scc_levels = {}
-            for scc_node in nx.topological_sort(condensed):
-                preds = list(condensed.predecessors(scc_node))
-                scc_levels[scc_node] = 0 if not preds else 1 + max(scc_levels[p] for p in preds)
+    #         scc_levels = {}
+    #         for scc_node in nx.topological_sort(condensed):
+    #             preds = list(condensed.predecessors(scc_node))
+    #             scc_levels[scc_node] = 0 if not preds else 1 + max(scc_levels[p] for p in preds)
 
-            # Map back to node-level
-            for node in filtered_graph.nodes:
-                scc_index = scc_map[node]
-                levels[node] = scc_levels[scc_index]
+    #         # Map back to node-level
+    #         for node in filtered_graph.nodes:
+    #             scc_index = scc_map[node]
+    #             levels[node] = scc_levels[scc_index]
 
-        # --- Plotting ---
-        level_nodes = defaultdict(list)
-        for node, lvl in levels.items():
-            level_nodes[lvl].append(node)
+    #     # --- Plotting ---
+    #     level_nodes = defaultdict(list)
+    #     for node, lvl in levels.items():
+    #         level_nodes[lvl].append(node)
 
-        pos = {}
-        max_level = max(level_nodes.keys()) if level_nodes else 0
-        max_nodes_per_level = max(len(nodes) for nodes in level_nodes.values()) if level_nodes else 0
+    #     pos = {}
+    #     max_level = max(level_nodes.keys()) if level_nodes else 0
+    #     max_nodes_per_level = max(len(nodes) for nodes in level_nodes.values()) if level_nodes else 0
 
-        horizontal_spacing = 2.0
-        vertical_spacing = 10
+    #     horizontal_spacing = 2.0
+    #     vertical_spacing = 10
 
-        for level, nodes in level_nodes.items():
-            for i, node in enumerate(nodes):
-                offset = (max_nodes_per_level - len(nodes)) / 2
-                if horizontal:
-                    pos[node] = (level * horizontal_spacing, -(i + offset) * vertical_spacing)
-                else:
-                    pos[node] = ((i + offset) * horizontal_spacing, -level * vertical_spacing)
+    #     for level, nodes in level_nodes.items():
+    #         for i, node in enumerate(nodes):
+    #             offset = (max_nodes_per_level - len(nodes)) / 2
+    #             if horizontal:
+    #                 pos[node] = (level * horizontal_spacing, -(i + offset) * vertical_spacing)
+    #             else:
+    #                 pos[node] = ((i + offset) * horizontal_spacing, -level * vertical_spacing)
 
-        node_colors = []
-        for node in filtered_graph.nodes:
-            kind = filtered_graph.nodes[node].get("kind", NodeKind.UNKNOWN)
-            if is_kind(kind, NodeKind.FUNCTION):
-                color = "lightblue" 
-                if is_kind(kind, NodeKind.CONSTRUCTOR):
-                    color = "skyblue"
-                elif is_kind(kind, NodeKind.DESTRUCTOR):
-                    color = "royalblue"
-            elif is_kind(kind, NodeKind.TYPE):
-                color = "orange"
-            elif is_kind(kind, NodeKind.VARIABLE):
-                color = "lightgreen"
-            else:
-                color = "red"
-            node_colors.append(color)
+    #     node_colors = []
+    #     for node in filtered_graph.nodes:
+    #         kind = filtered_graph.nodes[node].get("kind", NodeKind.UNKNOWN)
+    #         if is_kind(kind, NodeKind.FUNCTION):
+    #             color = "lightblue" 
+    #             if is_kind(kind, NodeKind.CONSTRUCTOR):
+    #                 color = "skyblue"
+    #             elif is_kind(kind, NodeKind.DESTRUCTOR):
+    #                 color = "royalblue"
+    #         elif is_kind(kind, NodeKind.TYPE):
+    #             color = "orange"
+    #         elif is_kind(kind, NodeKind.VARIABLE):
+    #             color = "lightgreen"
+    #         else:
+    #             color = "red"
+    #         node_colors.append(color)
 
-        edge_colors = []
-        for u, v, data in filtered_graph.edges(data=True):
-            edge_type = data.get("type", EdgeType.UNKNOWN)
-            if is_kind(edge_type, EdgeType.CALL):
-                color = "blue"
-            elif is_kind(edge_type, EdgeType.REFERENCE):
-                color = "green"
-            elif is_kind(edge_type, EdgeType.DEPENDENCY):
-                color = "orange"
-            else:
-                color = "gray"
-            edge_colors.append(color)
+    #     edge_colors = []
+    #     for u, v, data in filtered_graph.edges(data=True):
+    #         edge_type = data.get("type", EdgeType.UNKNOWN)
+    #         if is_kind(edge_type, EdgeType.CALL):
+    #             color = "blue"
+    #         elif is_kind(edge_type, EdgeType.REFERENCE):
+    #             color = "green"
+    #         elif is_kind(edge_type, EdgeType.DEPENDENCY):
+    #             color = "orange"
+    #         else:
+    #             color = "gray"
+    #         edge_colors.append(color)
 
-        plt.figure(figsize=(16, 10))
-        nx.draw_networkx_edges(
-            filtered_graph, pos, arrowstyle='-|>', arrowsize=10,
-            edge_color=edge_colors, width=0.8
-        )
-        nx.draw_networkx_nodes(filtered_graph, pos, node_size=400, node_color=node_colors)
-        nx.draw_networkx_labels(filtered_graph, pos, font_size=7, font_family='monospace')
+    #     plt.figure(figsize=(16, 10))
+    #     nx.draw_networkx_edges(
+    #         filtered_graph, pos, arrowstyle='-|>', arrowsize=10,
+    #         edge_color=edge_colors, width=0.8
+    #     )
+    #     nx.draw_networkx_nodes(filtered_graph, pos, node_size=400, node_color=node_colors)
+    #     nx.draw_networkx_labels(filtered_graph, pos, font_size=7, font_family='monospace')
 
-        plt.title("Code Graph Ordered by Levels (SCC-aware)")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.show()
+    #     plt.title("Code Graph Ordered by Levels (SCC-aware)")
+    #     plt.axis("off")
+    #     plt.tight_layout()
+    #     plt.show()
     
-    # ──────────────────── CFG helpers ─────────────────────────────
-
-    def build_cfg(cursor: cindex.Cursor) -> nx.DiGraph:
-        """
-        Given a clang.cindex.Cursor pointing at a function or compound statement,
-        build and return a NetworkX DiGraph representing its control-flow graph.
-        Nodes have attributes:
-        - 'ast': the Cursor for the statement
-        - 'label': a short label (e.g. 'if_cond', 'for_body', etc.)
-        Special nodes: '__entry__' and '__exit__'.
-        """
-        G = nx.DiGraph()
-        entry, exit = '__entry__', '__exit__'
-        G.add_node(entry), G.add_node(exit)
-
-        # For goto/label resolution
-        label_map = {}            # label spelling -> node ID
-        pending_gotos = []        # list of (label, goto_node_id) to resolve later
-
-        # Simple counter for unique node IDs
-        _counter = [0]
-        def unique_id(prefix: str) -> str:
-            _counter[0] += 1
-            return f"{prefix}_{_counter[0]}"
-
-        def make_node(ast: cindex.Cursor, label: str) -> str:
-            nid = unique_id(label)
-            G.add_node(nid, ast=ast, label=label)
-            return nid
-
-        def link(prev_nodes, next_node):
-            for p in prev_nodes:
-                G.add_edge(p, next_node)
-
-        def recurse(ast: cindex.Cursor, prev_nodes):
-            # Dispatch on kind
-            kind = ast.kind
-
-            # Compound: just sequence through children
-            if kind == cindex.CursorKind.COMPOUND_STMT:
-                cur = prev_nodes
-                for child in ast.get_children():
-                    cur = recurse(child, cur)
-                return cur
-
-            # IF / ELSE IF / ELSE
-            if kind == cindex.CursorKind.IF_STMT:
-                # AST children: [cond, then, else?]
-                children = list(ast.get_children())
-                cond_node = make_node(ast, 'if_cond')
-                link(prev_nodes, cond_node)
-
-                then_node = children[1] if len(children) > 1 else None
-                else_node = children[2] if len(children) > 2 else None
-
-                # process the "then" branch
-                then_exit = recurse(then_node, [cond_node]) if then_node else [cond_node]
-                # process the "else" branch (could itself be another IF => else-if)
-                else_exit = recurse(else_node, [cond_node]) if else_node else [cond_node]
-
-                # merge exits
-                return then_exit + else_exit
-
-            # WHILE loop
-            if kind == cindex.CursorKind.WHILE_STMT:
-                children = list(ast.get_children())
-                cond_cursor = children[0]
-                body_cursor = children[1] if len(children) > 1 else None
-
-                cond_node = make_node(ast, 'while_cond')
-                link(prev_nodes, cond_node)
-
-                body_exit = recurse(body_cursor, [cond_node]) if body_cursor else [cond_node]
-                for b in body_exit:
-                    G.add_edge(b, cond_node)   # back‐edge
-
-                # false‐branch falls through to next
-                return [cond_node]
-
-            # FOR loop
-            if kind == cindex.CursorKind.FOR_STMT:
-                # AST children: [init?, cond?, inc?, body]
-                children = list(ast.get_children())
-                init, cond_c, inc, body = None, None, None, None
-                if len(children) >= 1: init = children[0]
-                if len(children) >= 2: cond_c = children[1]
-                if len(children) >= 3: inc = children[2]
-                if len(children) >= 4: body = children[3]
-
-                # initializer
-                cur = recurse(init, prev_nodes) if init else prev_nodes
-
-                # condition check
-                cond_node = make_node(ast, 'for_cond')
-                link(cur, cond_node)
-
-                # body
-                body_exit = recurse(body, [cond_node]) if body else [cond_node]
-                # increment
-                inc_exit = recurse(inc, body_exit) if inc else body_exit
-                # back to test
-                for i in inc_exit:
-                    G.add_edge(i, cond_node)
-
-                # false-branch exits via cond_node
-                return [cond_node]
-
-            # SWITCH / CASE / DEFAULT
-            if kind == cindex.CursorKind.SWITCH_STMT:
-                cond_node = make_node(ast, 'switch_cond')
-                link(prev_nodes, cond_node)
-                exits = []
-
-                for child in ast.get_children():
-                    if child.kind in (cindex.CursorKind.CASE_STMT,
-                                    cindex.CursorKind.DEFAULT_STMT):
-                        case_node = make_node(child, 'case')
-                        G.add_edge(cond_node, case_node)
-                        case_exit = recurse(child, [case_node])
-                        exits.extend(case_exit)
-
-                return exits or [cond_node]
-
-            # LABEL
-            if kind == cindex.CursorKind.LABEL_STMT:
-                lbl = ast.spelling
-                lbl_node = make_node(ast, f'label_{lbl}')
-                link(prev_nodes, lbl_node)
-                label_map[lbl] = lbl_node
-
-                # resolve any gotos waiting on this label
-                for (want_lbl, goto_nid) in list(pending_gotos):
-                    if want_lbl == lbl:
-                        G.add_edge(goto_nid, lbl_node)
-                        pending_gotos.remove((want_lbl, goto_nid))
-                return [lbl_node]
-
-            # GOTO
-            if kind == cindex.CursorKind.GOTO_STMT:
-                # child is the label reference
-                tgt = next(ast.get_children()).spelling
-                goto_nid = make_node(ast, f'goto_{tgt}')
-                link(prev_nodes, goto_nid)
-
-                if tgt in label_map:
-                    G.add_edge(goto_nid, label_map[tgt])
-                else:
-                    pending_gotos.append((tgt, goto_nid))
-                # no fall‐through after goto
-                return []
-
-            # RETURN
-            if kind == cindex.CursorKind.RETURN_STMT:
-                ret_nid = make_node(ast, 'return')
-                link(prev_nodes, ret_nid)
-                G.add_edge(ret_nid, exit)
-                return []
-
-            # Everything else: one basic node
-            simple_nid = make_node(ast, kind.name.lower())
-            link(prev_nodes, simple_nid)
-            return [simple_nid]
-
-        # start recursion on the function/compound root
-        final_exits = recurse(cursor, [entry])
-
-        # anything that didn't explicitly return/goto should go to exit
-        for n in final_exits:
-            G.add_edge(n, exit)
-
-        return G
-
+    # ──────────────────── Compiler helpers ─────────────────────────────
 
     def lookup_functions(self, file: str, line: int) -> Optional[str]:
         """
@@ -1260,12 +1026,59 @@ class RepoAnalyzer(nx.DiGraph):
         """
         return [iv.data for iv in self.func_trees.get(file, IntervalTree()).at(line)]
 
-    def parse_missed_optimizations(self, yaml_path):
-        """
-        Parse a Clang .opt.yaml file and extract all !Missed records.
+    # def parse_missed_optimizations(self, yaml_path):
+    #     """
+    #     Parse a Clang .opt.yaml file and extract all !Missed records.
 
-        Returns a list of dicts:
-        [ { 'file': <path>, 'line': <int>, 'comment': <str> }, … ]
+    #     Returns a list of dicts:
+    #     [ { 'file': <path>, 'line': <int>, 'comment': <str> }, … ]
+    #     """
+    #     # 1) Tell PyYAML how to handle the !Missed (and other !) tags:
+    #     def unknown_tag_constructor(loader, tag_suffix, node):
+    #         data = loader.construct_mapping(node, deep=True)
+    #         data['_YamlTag_'] = tag_suffix
+    #         return data
+
+    #     SafeLoader = yaml.SafeLoader
+    #     SafeLoader.add_multi_constructor('!', unknown_tag_constructor)
+    #     def reconstruct_message(doc):
+    #         pieces = []
+    #         for arg in doc.get('Args', []):
+    #             if isinstance(arg, dict) and 'String' in arg:
+    #                 pieces.append(arg['String'])
+    #             elif 'Callee' in arg:
+    #                 pieces.append(self.demangle(arg['Callee']))
+    #             elif 'Caller' in arg:
+    #                 pieces.append(self.demangle(arg['Caller']))
+    #             # (handle other human names/types as needed)
+    #         return ''.join(pieces).strip()
+    #     with open(yaml_path, 'r') as stream:
+    #         for doc in yaml.load_all(stream, Loader=SafeLoader):
+    #             # Only care about !Missed entries
+    #             if isinstance(doc, dict) and doc.get('_YamlTag_') == 'Missed':
+    #                 dbg = doc.get('DebugLoc', {})
+    #                 src_file = dbg.get('File')
+    #                 if not src_file: continue
+    #                 src_file = os.path.abspath(src_file)
+    #                 if not self.in_proj(Path(src_file)): continue
+    #                 line_no  = dbg.get('Line')
+    #                 comment  = reconstruct_message(doc)  # e.g. "NoDefinition", "LoadClobbered", etc.
+    #                 functions = self.lookup_functions(src_file, line_no)
+    #                 if not functions:
+    #                     continue
+    #                 for func in functions:
+    #                     if 'missed_optimizations' not in self.nodes[func]:
+    #                         self.nodes[func]['missed_optimizations'] = defaultdict(set)
+    #                     normalized_line_number = line_no - self.nodes[func]['start_line']
+    #                     self.nodes[func]['missed_optimizations'][normalized_line_number].add(comment)
+
+    def parse_missed_optimizations(self, yaml_contents_list: List[str]):
+        """
+        Parse a list of Clang .opt.yaml file contents and extract all !Missed records.
+
+        Each element in `yaml_contents_list` should be the full contents of a .opt.yaml file.
+
+        Modifies self.nodes[func]['missed_optimizations'] in-place.
         """
         # 1) Tell PyYAML how to handle the !Missed (and other !) tags:
         def unknown_tag_constructor(loader, tag_suffix, node):
@@ -1275,6 +1088,7 @@ class RepoAnalyzer(nx.DiGraph):
 
         SafeLoader = yaml.SafeLoader
         SafeLoader.add_multi_constructor('!', unknown_tag_constructor)
+
         def reconstruct_message(doc):
             pieces = []
             for arg in doc.get('Args', []):
@@ -1284,19 +1098,22 @@ class RepoAnalyzer(nx.DiGraph):
                     pieces.append(self.demangle(arg['Callee']))
                 elif 'Caller' in arg:
                     pieces.append(self.demangle(arg['Caller']))
-                # (handle other human names/types as needed)
+                # Add more logic here if needed
             return ''.join(pieces).strip()
-        with open(yaml_path, 'r') as stream:
-            for doc in yaml.load_all(stream, Loader=SafeLoader):
-                # Only care about !Missed entries
+
+        for yaml_content in yaml_contents_list:
+            docs = yaml.load_all(yaml_content, Loader=SafeLoader)
+            for doc in docs:
                 if isinstance(doc, dict) and doc.get('_YamlTag_') == 'Missed':
                     dbg = doc.get('DebugLoc', {})
                     src_file = dbg.get('File')
-                    if not src_file: continue
+                    if not src_file:
+                        continue
                     src_file = os.path.abspath(src_file)
-                    if not self.in_proj(Path(src_file)): continue
-                    line_no  = dbg.get('Line')
-                    comment  = reconstruct_message(doc)  # e.g. "NoDefinition", "LoadClobbered", etc.
+                    if not self.in_proj(Path(src_file)):
+                        continue
+                    line_no = dbg.get('Line')
+                    comment = reconstruct_message(doc)
                     functions = self.lookup_functions(src_file, line_no)
                     if not functions:
                         continue
@@ -1305,4 +1122,3 @@ class RepoAnalyzer(nx.DiGraph):
                             self.nodes[func]['missed_optimizations'] = defaultdict(set)
                         normalized_line_number = line_no - self.nodes[func]['start_line']
                         self.nodes[func]['missed_optimizations'][normalized_line_number].add(comment)
-

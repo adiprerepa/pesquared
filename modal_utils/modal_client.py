@@ -21,8 +21,8 @@ vllm_image = vllm_image.env({"VLLM_USE_V0": "1"})
 
 
 MODELS_DIR = "/llamas"
-MODEL_NAME = "neuralmagic/Meta-Llama-3.1-8B-Instruct-quantized.w4a16"
-MODEL_REVISION = "a7c09948d9a632c2c840722f519672cd94af885d"
+MODEL_NAME = "meta-llama/Llama-3.2-1B"
+# MODEL_REVISION = "a7c09948d9a632c2c840722f519672cd94af885d"
 
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
@@ -41,7 +41,7 @@ VLLM_PORT = 8000
 
 @app.function(
     image=vllm_image,
-    gpu=f"A10G:{N_GPU}",
+    gpu=f"A100:{N_GPU}",
     secrets=[API_KEY_SECRET],
     scaledown_window=15 * MINUTES,
     volumes={
@@ -62,8 +62,8 @@ def serve():
         "serve",
         "--uvicorn-log-level=info",
         MODEL_NAME,
-        "--revision",
-        MODEL_REVISION,
+        # "--revision",
+        # MODEL_REVISION,
         "--host",
         "0.0.0.0",
         "--port",

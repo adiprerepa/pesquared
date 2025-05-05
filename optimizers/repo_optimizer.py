@@ -1,9 +1,8 @@
-from typing import Optional, List, Dict, Union
+import json
+from typing import Optional, List, Dict, Tuple, Union
 import os
-import openai
-import anthropic
-from google import generativeai as genai
-from google.generativeai import types
+import re
+from llms.llm import UniversalLLM
 from collections import deque
 import networkx as nx
 from analyzers.repo_analyzer import NodeKind, RepoAnalyzer, is_kind
@@ -22,296 +21,13 @@ logger = logging.getLogger(__name__)
 ai_counter = 0
 
 class RepoOptimizer:
-    def __init__(self, model: str, provider: str, repo_analyzer: RepoAnalyzer, pv: PerformanceVerifier):
-        self.model = model
-        self.provider = provider.lower()
-        self.api_key = os.getenv(f"{provider.upper()}_API_KEY")
+    """
+    Optimizes C++ code using LLMs.
+    """
+    def __init__(self, repo_analyzer: RepoAnalyzer):
         self.repo_analyzer = repo_analyzer
-        self.stack_analyzer = StackAnalyzer(str(repo_analyzer.perfstacks_dir))
-        self.pv = pv
-        self._configure(model, provider)
-    
-    def _configure(self, model: str, provider: str):
-        """
-        Configure the LLM client based on the provider.
-        """
-        self.model = model
-        if provider == "openai":
-            self.client = openai.OpenAI(api_key=self.api_key)
-        elif provider == "anthropic":
-            self.client = anthropic.Anthropic(api_key=self.api_key)
-        elif provider == "google":
-            genai.configure(api_key=self.api_key)
-            self.client = genai
-        else:
-            raise ValueError(f"Unsupported provider: {provider!r}. "
-                             "Use one of ['openai', 'anthropic', 'google'].")
 
-    def prompt(self,
-        input_prompt: str,
-        context_window: Optional[List[str]] = None,
-        system_message: Optional[str] = "You are an expert C++ performance optimization engineer.",
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
-        response_schema: Optional[Dict] = None,
-        ) -> Union[str, Dict]:
-        """
-        Send a prompt to the LLM and get a response.
-
-        Args:
-            input_prompt: The prompt to send
-            context_window: Optional list of context messages
-            system_message: Optional system message
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens in response
-            response_schema: Optional JSON schema to constrain the output
-
-        Returns:
-            Either a string response (if no schema) or a dictionary (if schema provided)
-        """
-
-        if self.provider in ("openai", "anthropic"):
-            # Build the messages array
-            messages = []
-            if system_message:
-                messages.append({"role": "system", "content": system_message})
-            if context_window:
-                messages.extend({"role": "user", "content": m} for m in context_window)
-            messages.append({"role": "user", "content": input_prompt})
-
-            # === OPENAI branch ===
-            if self.provider == "openai":
-                if response_schema:
-                    # 1) Wrap your schema in a single function definition
-                    functions = [{
-                        "name": "optimization_response",
-                        "description": "Structured C++ optimization output",
-                        "parameters": response_schema,
-                    }]
-
-                    # 2) Ask the model to call that function
-                    resp = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        functions=functions,
-                        function_call={"name": "optimization_response"},
-                    )
-
-                    # 3) Pull the JSON arguments out of the function_call
-                    func_call = resp.choices[0].message.function_call
-                    import json
-                    return json.loads(func_call.arguments)
-                else:
-                    resp = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    return resp.choices[0].message.content
-
-            else:  # anthropic
-                if response_schema:
-                    tools = [{
-                        "name": "json_output",
-                        "description": "Respond with a JSON object.",
-                        "input_schema": response_schema,
-                    }]
-                    resp = self.client.messages.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        tool_choice={"type": "tool", "name": "json_output"},
-                    )
-                    if resp.content[0].type == "tool_use":
-                        return resp.content[0].input
-                    else:
-                        return resp.content[0].text
-                else:
-                    resp = self.client.messages.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    return resp.content[0].text
-
-        elif self.provider == "google":
-            # Gemini branch (unchanged from earlier)
-            model = self.client.GenerativeModel(self.model)
-            full_prompt = ""
-            if system_message:
-                full_prompt += f"{system_message}\n\n"
-            if context_window:
-                full_prompt += "\n".join(context_window) + "\n\n"
-            full_prompt += input_prompt
-
-            if response_schema:
-                generation_config = self.client.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                )
-                resp = model.generate_content(full_prompt, generation_config=generation_config)
-                print("--- RAW RESPONSE ---")
-                print(resp.text)
-                print("--- END RAW RESPONSE ---")
-                import json
-                import re
-
-                try:
-                    return json.loads(resp.text)
-                except json.JSONDecodeError:
-                    print("Bad JSON, trying to fix it...")
-                    # Try a simple fix: trim to the first full JSON object
-                    match = re.search(r'\{.*\}', resp.text, re.DOTALL)
-                    if match:
-                        try:
-                            return json.loads(match.group(0))
-                        except json.JSONDecodeError as e:
-                            raise ValueError(f"Still bad JSON after repair attempt: {e}")
-                    else:
-                        raise ValueError(f"Cannot find JSON object in response: {resp.text}")
-            else:
-                generation_config = self.client.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                )
-                resp = model.generate_content(full_prompt, generation_config=generation_config)
-                return resp.text
-
-        else:
-            raise RuntimeError(f"Invalid provider: {self.provider!r}")
-
-    async def prompt_async(
-        self,
-        input_prompt: str,
-        context_window: Optional[List[str]] = None,
-        system_message: Optional[str] = "You are an expert C++ performance optimization engineer.",
-        temperature: float = 0.9,
-        max_tokens: int = 4096,
-        response_schema: Optional[Dict] = None,
-    ) -> Union[str, Dict]:
-        """
-        Async version of prompt: Send a prompt to the LLM and get a response.
-        """
-        if self.provider in ("openai", "anthropic"):
-            messages = []
-            if system_message:
-                messages.append({"role": "system", "content": system_message})
-            if context_window:
-                messages.extend({"role": "user", "content": m} for m in context_window)
-            messages.append({"role": "user", "content": input_prompt})
-
-            if self.provider == "openai":
-                if response_schema:
-                    functions = [{
-                        "name": "optimization_response",
-                        "description": "Structured C++ optimization output",
-                        "parameters": response_schema,
-                    }]
-                    resp = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        functions=functions,
-                        function_call={"name": "optimization_response"},
-                    )
-                    import json
-                    return json.loads(resp.choices[0].message.function_call.arguments)
-                else:
-                    resp = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    return resp.choices[0].message.content
-
-            else:  # anthropic
-                if response_schema:
-                    tools = [{
-                        "name": "json_output",
-                        "description": "Respond with a JSON object.",
-                        "input_schema": response_schema,
-                    }]
-                    resp = self.client.messages.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        tool_choice={"type": "tool", "name": "json_output"},
-                    )
-                    if resp.content[0].type == "tool_use":
-                        return resp.content[0].input
-                    else:
-                        return resp.content[0].text
-                else:
-                    resp = self.client.messages.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    return resp.content[0].text
-
-        elif self.provider == "google":
-            model = self.client.GenerativeModel(self.model)
-            full_prompt = ""
-            if system_message:
-                full_prompt += f"{system_message}\n\n"
-            if context_window:
-                full_prompt += "\n".join(context_window) + "\n\n"
-            full_prompt += input_prompt
-
-            if response_schema:
-                generation_config = self.client.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                )
-                loop = asyncio.get_event_loop()
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda: model.generate_content(full_prompt, generation_config=generation_config)
-                )
-                import json
-                import re
-                try:
-                    return json.loads(resp.text)
-                except json.JSONDecodeError:
-                    match = re.search(r'\{.*\}', resp.text, re.DOTALL)
-                    if match:
-                        try:
-                            return json.loads(match.group(0))
-                        except json.JSONDecodeError as e:
-                            raise ValueError(f"Still bad JSON after repair attempt: {e}")
-                    else:
-                        raise ValueError(f"Cannot find JSON object in response: {resp.text}")
-            else:
-                generation_config = self.client.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                )
-                loop = asyncio.get_event_loop()
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda: model.generate_content(full_prompt, generation_config=generation_config)
-                )
-                return resp.text
-
-        else:
-            raise RuntimeError(f"Invalid provider: {self.provider!r}")
-
-    async def optimize_function(
+    async def build_optimization_prompt_callable(
         self,
         node: str,
         obfuscation_tier: int = 0,
@@ -320,19 +36,11 @@ class RepoOptimizer:
         node_filter: Optional[callable] = None,   # expects lambda (node_id, attrs) -> bool
         edge_filter: Optional[callable] = None,   # expects lambda ((u,v), attrs) -> bool
         caller_depth: int = 0,
-        samples: int = 3,
         include_clang_remarks: bool = False,
         model: Optional[str] = None,
         provider: Optional[str] = None,
-    ) -> Dict:
-        global ai_counter
-        """
-        Optimize a code node from a graph.  Gathers up to `context_depth` hops
-        of neighbors (filtered by node_filter/edge_filter), obfuscates them,
-        sends to the LLM, then deobfuscates the diff.
-        """
-        if model and provider:
-            self._configure(model, provider)
+    ):
+        llm = UniversalLLM(model, provider)
         # 1) Grab the code for the target node
         code = self.repo_analyzer.get_code(node)
         if not code:
@@ -393,7 +101,6 @@ class RepoOptimizer:
             context_window.append(
                 f"📄 Makefile FLAGS\n```Makefile\n{makefile_flags}\n```"
             )
-            logger.info(f"Makefile FLAGS: {makefile_flags}")
 
         # Callees
         for n in callee_nodes:
@@ -404,7 +111,6 @@ class RepoOptimizer:
                 context_window.append(
                     f"📄 Callee — {obfuscator.obfuscate(n)}\n```cpp\n{ob_snippet}\n```"
                 )
-                # logger.debug(f"Callee {n}: {ob_snippet}")
 
         # Callers
         for n in caller_nodes:
@@ -415,7 +121,7 @@ class RepoOptimizer:
                 context_window.append(
                     f"📄 Caller — {obfuscator.obfuscate(n)}\n```cpp\n{ob_snippet}\n```"
                 )
-                # logger.debug(f"Caller {n}: {ob_snippet}")
+        context_window = "\n".join(context_window)
 
         ob_code = obfuscator.obfuscate(code)
         # Attach clang remarks to obfuscated code
@@ -432,227 +138,171 @@ class RepoOptimizer:
         # logger.info(f"Obfuscated code: {ob_code}")
         obfuscated_node = obfuscator.obfuscate(node)
 
-        # Determine if function is "long"
-        is_long_function = False
+        with open('/home/ayuram/pesquared/prompts/singlefunction_imports_makeflags.txt', 'r') as f:
+            prompt = f.read().format(**{
+                'function': obfuscated_node,
+                'code': ob_code,
+            })
 
-        # 6) Build the structured prompt (unified-diff focus)
-        prompt = (
-            f"You are an expert C++ performance engineer. Optimize the following C++ function `{obfuscated_node}` for performance.\n\n"
-            +
-            (
-               """CRITICAL REQUIREMENTS:\n
-1. DO NOT modify the function signature (parameter types, return type, name) - it MUST remain EXACTLY as provided\n
-2. DO NOT inline the function or merge it with others\n
-3. ONLY modify the internal implementation while preserving exact behavior\n
-4. If no valuable optimizations exist, return the original function unmodified\n
-5. Your code MUST compile without errors\n""" 
-            )
-            +
-            (
-                'You have access to:\n'
-                '- Callee context\n'
-                '- Caller context\n\n'
-            )
-            +
-            "Please note:\n"
-            f"- Callees and Callers are NOT exclusive to `{obfuscated_node}` and might be used by other functions\n"
-            f"{'- The code is fully correct and compilable as is' if (obfuscation_tier == 0) else '- The code has been obfuscated but is still correct and compilable as is'}\n\n"
-            f"{'⚙️ Return strictly as unified diffs.' if is_long_function else '✍️ Return the changed functions as a drop-in replacement. Do NOT return a diff; Do NOT skip lines; Do NOT change the signature; return the full rewritten function.'}\n\n"
-            "```cpp\n"
-            f"{ob_code}\n"
-            "```\n\n"
-            'Your response is machine-processed, so include every detail verbosely. CRITICALLY: Do NOT alter the function name or signature!!! If an optimization is not possible given these constraints, simply return an empty list of optimizations\n\n'
-            +
-            (
-                "Your code should look something like:\n"
-                f"{obfuscated_node.splitlines()[0]} // <only change the body>\n"
-            )
-        )
-        response_schema = {
-            "type": "object",
-            "required": ["insights", "optimizations"],
-            "properties": {
-                "branch_name": {
-                    "type": "string",
-                    "description": (
-                        "Name of the branch to create for this optimization"
-                    )
-                },
-                "commit_message": {
-                    "type": "string",
-                    "description": (
-                        "Commit message for the optimization"
-                    )
-                },
-                "insights": {
-                    "type": "string",
-                    "description": "Outline of your plan: what to change and why"
-                },
-                "optimizations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": [
-                            "function_name",
-                            "brief_description",
-                            "new_imports",
-                            # "new_objects",
-                            "rewritten_function"
-                        ],
-                        "properties": {
-                            "function_name": {
-                                "type": "string",
-                                "description": "The name of the function you changed"
-                            },
-                            "brief_description": {
-                                "type": "string",
-                                "description": "Brief description of change"
-                            },
-                            "new_imports": {
-                                "type": "string",
-                                "description": "New imports or '// NO CHANGES NEEDED'"
-                            },
-                            # "new_objects": {
-                            #     "type": "string",
-                            #     "description": "New functions/structs/classes/variables or '// NO CHANGES NEEDED'"
-                            # },
-                            "rewritten_function": {
-                                "type": "string",
-                                "description": (
-                                    f"{ob_code.splitlines()[0]}\n    <only change the body>\n" + "}\n or '// NO CHANGES NEEDED'"
-                                )
-                            }
-                        }
-                    }
-                },
-                "makefile_flags": {
-                    "type": "string",
-                    "description": (
-                        "New Makefile FLAGS, e.g. 'FLAGS := <new build flags>' "
-                        "or '// NO CHANGES NEEDED'"
-                    )
-                }
-            }
-        }
-
-        # 7) Send to the LLM
-        tasks = [
-            self.prompt_async(
-            input_prompt=prompt,
-            context_window=context_window,
-            system_message=system_message,
-            response_schema=response_schema,
-            )
-            for _ in range(samples)
-        ]
-        responses = await asyncio.gather(*tasks)
-        # TODO: actually run all responses
-        # Use the first non-string response as the raw response
-        raw_resp = next((resp for resp in responses if not isinstance(resp, str)), None)
-        logger.debug(f"LLM responses: {raw_resp}")
-        if raw_resp is None:
-            raise ValueError(f"All LLM responses were strings: {responses}")
-
-        if isinstance(raw_resp, str):
-            raise ValueError(f"LLM returned a string instead of JSON: {raw_resp}")
+        used_nodes = [node] + callee_nodes + caller_nodes
+         # 7) Send to the LLM
+        return await llm.prompt_async(
+                input_prompt=prompt,
+                context_window=context_window,
+                system_message=system_message,
+            ), obfuscator, used_nodes, obfuscation_tier, callee_depth, include_clang_remarks
+    
+    def implement_optimization(self, raw_resp, obfuscator: CodeObfuscator, used_nodes, obfuscation_tier, callee_depth, include_clang_remarks):
+        """
+        Implement the optimization by applying the changes to the codebase.
+        """
+        global ai_counter
         # De-obfuscate the response
+        logger.info(f"Raw response: {raw_resp} from {used_nodes[0]} by {self.model}")
+        if 'optimizations' not in raw_resp:
+            logger.info(f"Model gave no optimizations, skipping {used_nodes[0]}")
+            return {"model_optimized": False}
+        opt = raw_resp.get("optimizations", None)
+        if not isinstance(opt, dict):
+            # try to parse it
+            try:
+                opt = json.loads(opt)
+            except:
+                logger.error(f"Failed to parse optimization response: {opt}")
+                return {"model_optimized": False}
         response = {
-            "branch_name": raw_resp.get("branch_name", f"{node}"),
+            "branch_name": raw_resp.get("branch_name", f"{used_nodes[0]}"),
             "commit_message": raw_resp.get("commit_message", 0),
             "insights": raw_resp.get("insights", 0),
-            "optimizations": [
+            "optimizations":
                 {
-                    "function_name": obfuscator.deobfuscate(opt["function_name"]),
+                    "function_name": obfuscator.deobfuscate(opt.get('function_name', used_nodes[0])),
                     "brief_description": obfuscator.deobfuscate(opt["brief_description"]),
-                    "new_imports": opt["new_imports"],
+                    "new_imports": opt.get("new_imports", "// NO CHANGES NEEDED"),
                     # "new_objects": opt["new_objects"],
-                    "rewritten_function": obfuscator.deobfuscate(opt["rewritten_function"]),
-                }
-                for opt in raw_resp["optimizations"]
-            ],
-            "makefile_flags": raw_resp.get("makefile_flags", "// NO CHANGES NEEDED")
+                    "new_function": obfuscator.deobfuscate(opt["new_function"]),
+                },
+            "makefile_flags": raw_resp.get("makefile_flags", "// NO CHANGES NEEDED"),
+            "obfuscation_tier": obfuscation_tier,
+            "callee_depth": callee_depth,
+            "include_clang_remarks": include_clang_remarks,
         }
-        used_nodes = caller_nodes + callee_nodes + [node]
-        optimizations = response['optimizations']
-        if len(optimizations) == 0 or 'branch_name' not in response or response['branch_name'].startswith('//'):
-            logger.info(f"Model gave no optimizations, skipping {node}")
+        if  "branch_name" not in response or response["branch_name"].startswith('//'):
+            logger.info(f"Model gave no optimizations, skipping {used_nodes[0]}")
             return {"model_optimized": False}
-        for opt in optimizations:
-            function_name = opt['function_name']
-            # Choose the node with the highest similarity ratio using SequenceMatcher
-            highest_similarity = 0.0
-            best_node = None
-            for node in used_nodes:
-                if not is_kind(self.repo_analyzer.nodes[node].get("kind", NodeKind.UNKNOWN), NodeKind.FUNCTION):
-                    continue
-                if not is_kind(self.repo_analyzer.nodes[node].get("kind", NodeKind.UNKNOWN), NodeKind.IN_CODEBASE):
-                    continue
-                similarity = SequenceMatcher(None, function_name.replace(' ', '').split('(')[0], node.replace(' ', '').split('(')[0]).ratio()
-                if similarity > highest_similarity:
-                    highest_similarity = similarity
-                    best_node = node
-            print(f"Best match for {function_name} is {best_node} with similarity {highest_similarity:.2f}")
-            rewritten_function = opt['rewritten_function']
-            new_imports = opt['new_imports']
-            # new_objects = opt['new_objects']
-            branch_name = f"ai-{ai_counter}/{response["branch_name"]}"
 
-            if not git_utils.create_branch(branch_name=branch_name, codebase_dir=self.repo_analyzer.repo_path):
-                print(f"FATAL: Could not create branch {branch_name}, skipping...")
-                return
-            
-            with git_utils.temp_checkout(branch_name=branch_name, codebase_dir=self.repo_analyzer.repo_path, quiet=False):
-                # Write the new function to the repo
-                if rewritten_function != "// NO CHANGES NEEDED":
-                    fn = self.repo_analyzer.write_function(
-                        function=best_node,
-                        code=rewritten_function
-                    )
-                    
-                # Add the new imports statements to the file
-                if new_imports != "// NO CHANGES NEEDED":
-                    self.repo_analyzer.add_imports(
-                        fn=fn,
-                        imports=new_imports
-                    )
-                
-                # Add the new objects to a file next to the function
-                # if new_objects != "// NO CHANGES NEEDED":
-                #     self.repo_analyzer.add_objects(
-                #         fn=fn,
-                #         objects=new_objects
-                #     )
-                # Write the new Makefile flags to the repo
-                if response['makefile_flags'] != "// NO CHANGES NEEDED":
-                    append = False
-                    value = ""
-                    if '+=' in response['makefile_flags']:
-                        append = True
-                        value = response['makefile_flags'].split('+=')[1].strip()
-                    elif ':=' in response['makefile_flags']:
-                        value = response['makefile_flags'].split(':=')[1].strip()
-                    else:
-                        value = ''
-                        append = True
-                    self.repo_analyzer.write_to_makefile(
-                        field='FLAGS',
-                        value=value,
-                        append=append,
-                    )
-                git_utils.stage_file(self.repo_analyzer.nodes[best_node]['file'], codebase_dir=self.repo_analyzer.repo_path)
-                git_utils.commit_changes(response["commit_message"], codebase_dir=self.repo_analyzer.repo_path)
-        # 8) Verify the performance of the optimization
-        perf, tests_pass = self.pv.get_performance(branch=branch_name)
-        if perf is None:
-            print(f"Could not get performance for branch {branch_name}, likely due to a failed build.")
+        logger.info(response)
+        opt = response['optimizations']
+        function_name = opt['function_name']
+        # Choose the node with the highest similarity ratio using SequenceMatcher
+        highest_similarity = 0.0
+        best_node = None
+        for node in used_nodes:
+            if not is_kind(self.repo_analyzer.nodes[node].get("kind", NodeKind.UNKNOWN), NodeKind.FUNCTION):
+                continue
+            if not is_kind(self.repo_analyzer.nodes[node].get("kind", NodeKind.UNKNOWN), NodeKind.IN_CODEBASE):
+                continue
+            similarity = SequenceMatcher(None, function_name.replace(' ', '').split('(')[0], node.replace(' ', '').split('(')[0]).ratio()
+            if similarity > highest_similarity:
+                highest_similarity = similarity
+                best_node = node
+        print(f"Best match for {function_name} is {best_node} with similarity {highest_similarity:.2f}")
+        new_function = opt['new_function']
+        new_imports = opt['new_imports']
+        # new_objects = opt['new_objects']
+        branch_name = f"ai-{ai_counter}/{response["branch_name"]}"
         ai_counter += 1
+
+        if not git_utils.create_branch(branch_name=branch_name, codebase_dir=self.repo_analyzer.repo_path):
+            print(f"FATAL: Could not create branch {branch_name}, skipping...")
+            return
+        
+        with git_utils.temp_checkout(branch_name=branch_name, codebase_dir=self.repo_analyzer.repo_path, quiet=False):
+            # Write the new function to the repo
+            if new_function != "// NO CHANGES NEEDED":
+                fn = self.repo_analyzer.write_function(
+                    function=best_node,
+                    code=new_function
+                )
+                
+            # Add the new imports statements to the file
+            if new_imports != "// NO CHANGES NEEDED":
+                self.repo_analyzer.add_imports(
+                    fn=fn,
+                    imports=new_imports
+                )
+            
+            # Add the new objects to a file next to the function
+            # if new_objects != "// NO CHANGES NEEDED":
+            #     self.repo_analyzer.add_objects(
+            #         fn=fn,
+            #         objects=new_objects
+            #     )
+            # Write the new Makefile flags to the repo
+            if response['makefile_flags'] != "// NO CHANGES NEEDED":
+                append = False
+                value = ""
+                if '+=' in response['makefile_flags']:
+                    append = True
+                    value = response['makefile_flags'].split('+=')[1].strip()
+                elif ':=' in response['makefile_flags']:
+                    value = response['makefile_flags'].split(':=')[1].strip()
+                else:
+                    value = ''
+                    append = True
+                self.repo_analyzer.write_to_makefile(
+                    field='FLAGS',
+                    value=value,
+                    append=append,
+                )
+            git_utils.stage_file(self.repo_analyzer.nodes[best_node]['file'], codebase_dir=self.repo_analyzer.repo_path)
+            git_utils.commit_changes(response["commit_message"], codebase_dir=self.repo_analyzer.repo_path)
         return {
-            **perf,
-            "tests_pass": tests_pass,
-            "branch_name": response['branch_name'],
+            "branch_name": branch_name,
             "insights": response['insights'],
-            "model_optimized": True
+            "model_optimized": True,
+            'model': self.model,
+            'provider': self.provider,
+            'obfuscation_tier': obfuscation_tier,
+            'callee_depth': callee_depth,
+            'include_clang_remarks': include_clang_remarks,
         }
+        
+        
+
+    async def optimize_function(
+        self,
+        node: str,
+        obfuscation_tier: int = 0,
+        system_message: Optional[str] = None,
+        callee_depth: int = 0,
+        node_filter: Optional[callable] = None,   # expects lambda (node_id, attrs) -> bool
+        edge_filter: Optional[callable] = None,   # expects lambda ((u,v), attrs) -> bool
+        caller_depth: int = 0,
+        include_clang_remarks: bool = False,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> Dict:
+        global ai_counter
+        """
+        Optimize a code node from a graph.  Gathers up to `context_depth` hops
+        of neighbors (filtered by node_filter/edge_filter), obfuscates them,
+        sends to the LLM, then deobfuscates the diff.
+        """
+        raw_resp, obfuscator, used_nodes = await self.build_optimization_prompt_callable(
+            node=node,
+            obfuscation_tier=obfuscation_tier,
+            system_message=system_message,
+            callee_depth=callee_depth,
+            node_filter=node_filter,
+            edge_filter=edge_filter,
+            caller_depth=caller_depth,
+            include_clang_remarks=include_clang_remarks,
+            model=model,
+            provider=provider
+        )
+        return self.implement_optimization(raw_resp, obfuscator, used_nodes)
+        
         
     
     def optimize_repo(self):

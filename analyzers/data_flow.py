@@ -2,15 +2,15 @@ from typing import List
 import clang.cindex
 import networkx as nx
 from collections import defaultdict
+from utils.graph_utils import DAGish
 
-class DataFlowGraph:
+class DataFlowGraph(DAGish):
     def __init__(self, tu_cursor, file: List[str]):
         """
         tu_cursor: a clang.cindex.Cursor pointing at the translation unit
         """
         self.tu_cursor = tu_cursor
         self.file = file
-        self.graph = nx.DiGraph()
         # Map variable USR -> list of definition nodes (node_ids)
         self.defs = defaultdict(list)
         self._build()
@@ -38,8 +38,8 @@ class DataFlowGraph:
 
     def _add_node(self, cursor):
         nid = self._get_node_id(cursor)
-        if not self.graph.has_node(nid):
-            self.graph.add_node(
+        if not self.has_node(nid):
+            self.add_node(
                 nid,
                 code=self._get_code_snippet(cursor),
                 line=cursor.location.line,
@@ -86,7 +86,7 @@ class DataFlowGraph:
             var_usr = def_cursor.get_usr()
             use_nid = self._add_node(cursor)
             for def_nid in self.defs.get(var_usr, []):
-                self.graph.add_edge(def_nid, use_nid)
+                self.add_edge(def_nid, use_nid)
 
     def _visit(self, cursor):
         """
@@ -110,35 +110,9 @@ class DataFlowGraph:
         # recurse
         for child in cursor.get_children():
             self._visit(child)
-
+    
     def _build(self):
-        """Kick off the AST walk from the translation-unit cursor."""
+        """
+        Build the data flow graph from the AST.
+        """
         self._visit(self.tu_cursor)
-
-    def plot(self):
-        """
-        Simple matplotlib-based visualization of the graph.
-        Note: networkx drawing may require Graphviz for nicer layouts.
-        """
-        import matplotlib.pyplot as plt
-        pos = nx.spring_layout(self.graph)
-        plt.figure(figsize=(12, 8))
-        nx.draw(self.graph, pos, with_labels=False, node_size=700,
-                arrowsize=20)
-        # draw custom labels (the code snippets)
-        labels = {n: self.graph.nodes[n]['label'] for n in self.graph.nodes()}
-        nx.draw_networkx_labels(self.graph, pos, labels=labels, font_size=8)
-        plt.tight_layout()
-        plt.show()
-
-# Usage example (assuming you've created a TranslationUnit `tu`):
-#
-# import clang.cindex
-# index = clang.cindex.Index.create()
-# tu = index.parse('foo.cpp', args=['-std=c++17'])
-# dfg = DataFlowGraph(tu.cursor)
-# dfg.visualize('foo_dfg.png')
-#
-# Now `dfg.graph` is your NetworkX DiGraph, with:
-#  - node attributes: 'code', 'line', 'file'
-#  - edges representing data flow dependencies.
