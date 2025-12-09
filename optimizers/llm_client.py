@@ -65,34 +65,40 @@ class DummyLLMClient(LLMClient):
         Returns:
             A deterministic placeholder response
         """
-        # Extract function name if present in prompt
+        # Extract the entire original function from the prompt
         import re
-        func_match = re.search(r'def\s+(\w+)\s*\(', prompt)
-        func_name = func_match.group(1) if func_match else "unknown_function"
         
-        # Return a deterministic placeholder optimization
-        return f"""# Optimized version of {func_name}
-# This is a dummy response from DummyLLMClient
-# In a real scenario, this would contain LLM-generated optimized code
+        # Look for the function in a code block
+        code_block_match = re.search(r'```python\n(def\s+\w+.*?)```', prompt, re.DOTALL)
+        if code_block_match:
+            original_function = code_block_match.group(1).strip()
+        else:
+            # Try without code blocks
+            func_match = re.search(r'(def\s+\w+\s*\([^)]*\):.*?)(?:\n\S|\Z)', prompt, re.DOTALL)
+            if func_match:
+                original_function = func_match.group(1).strip()
+            else:
+                # Fallback
+                original_function = "def unknown_function():\n    pass"
+        
+        # Return a properly formatted response that the optimizer can parse
+        # For safety, return the original function unchanged but with a comment
+        return f"""EXPLANATION:
+This is a dummy/placeholder optimization from DummyLLMClient.
+In a real scenario, an LLM would analyze the code and suggest specific improvements such as:
+- Algorithmic optimizations (e.g., reducing time complexity)
+- Data structure improvements (e.g., using sets instead of lists for membership checks)
+- Avoiding repeated computations (caching/memoization)
+- Using built-in functions or library optimizations
+- Generator expressions instead of list comprehensions where appropriate
 
-def {func_name}_optimized(*args, **kwargs):
-    # Placeholder optimization:
-    # - Added memoization
-    # - Replaced list comprehensions with generator expressions
-    # - Used more efficient data structures
-    
-    # TODO: Replace this with actual optimized implementation
-    # For testing purposes, this returns the same result
-    pass
+For testing purposes, this returns the original function unchanged to maintain correctness.
+To see real optimizations, use --use-real-llm flag with a valid OpenAI API key.
 
-# Explanation:
-# This is a placeholder optimization. In production, an LLM would analyze
-# the code and suggest specific improvements like:
-# - Algorithmic optimizations (e.g., O(n^2) -> O(n log n))
-# - Data structure improvements
-# - Caching/memoization opportunities
-# - Vectorization or parallelization
-"""
+OPTIMIZED_CODE:
+```python
+{original_function}
+```"""
     
     def get_model_name(self) -> str:
         """Get the model name."""
