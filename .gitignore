@@ -4,4 +4,13 @@ venv/
 .env
 .idea/
 .vscode/
+.pytest_cache/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
 
