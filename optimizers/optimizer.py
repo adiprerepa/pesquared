@@ -9,7 +9,7 @@ profile → construct prompt → query LLM → return optimization result.
 import inspect
 import textwrap
 from dataclasses import dataclass
-from typing import Callable, Any, Optional
+from typing import Callable, Any, Optional, Tuple
 
 from analyzers.profiler import ProfileSummary, profile_function, format_profile_summary
 from optimizers.llm_client import LLMClient, create_llm_client
@@ -85,7 +85,7 @@ Function to optimize: {function_name}
     return prompt
 
 
-def parse_llm_response(response: str) -> tuple[str, str]:
+def parse_llm_response(response: str) -> Tuple[str, str]:
     """
     Parse LLM response to extract explanation and optimized code.
     
