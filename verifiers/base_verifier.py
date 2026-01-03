@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Tuple, List
 
 from analyzers.clang_remark_analyzer import OptimizationRemark
+from analyzers.stack_analyzer import StackAnalyzer
 
 
 class PerformanceVerifier(ABC):
@@ -23,7 +24,7 @@ class PerformanceVerifier(ABC):
         self.codebase_dir = codebase_dir
 
     @abstractmethod
-    def get_remarks(self, branch="") -> List[OptimizationRemark]:
+    def get_remarks(self, branch="") -> List[OptimizationRemark | str]:
         """
         Retrieve a list of optimization remarks for a given branch.
         
@@ -33,12 +34,12 @@ class PerformanceVerifier(ABC):
         
         Returns:
             A list of OptimizationRemark objects summarizing compiler
-            optimization diagnostics.
+            optimization diagnostics OR a list of yaml content strings of the raw .opt.yaml files.
         """
         pass
 
     @abstractmethod
-    def get_performance(self, branch="") -> Tuple[Dict, bool]:
+    def get_performance(self, branch="", n_iters=1) -> Tuple[Dict, bool]:
         """
         Get performance metrics for a specific branch.
         
@@ -114,3 +115,8 @@ class PerformanceVerifier(ABC):
             Error message string if compilation fails, empty string if successful
         """
         pass
+
+    def get_counters_for_function_from_directory(self, directory, function_name):
+        analyzer = StackAnalyzer(directory)
+        fstats = analyzer.get_function_stats(function_name)
+        return fstats.exclusive_time if fstats else -1
