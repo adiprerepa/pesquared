@@ -777,13 +777,13 @@ class RepoAnalyzer(DAGish):
                 for line in code.splitlines():
                     if ":=" in line:
                         name = line.split(":=")[0].strip()
-                        self.add_node(name, kind=NodeKind.VARIABLE | NodeKind.IN_CODEBASE, code=line)
+                        self.add_node(name, kind=NodeKind.VARIABLE | NodeKind.IN_CODEBASE, code=line, label=f'Makefile::{name}')
     
     def induce_subgraph(
         self,
         node_filter: Optional[callable] = None,
         edge_filter: Optional[callable] = None
-    ) -> nx.DiGraph:
+    ) -> DAGish:
         """
         Induces a subgraph based on user-defined filters for nodes and edges.
     
@@ -805,7 +805,7 @@ class RepoAnalyzer(DAGish):
             filtered_nodes = list(self.nodes)
     
         # Create a subgraph with the filtered nodes
-        induced_graph = nx.DiGraph(self).subgraph(filtered_nodes).copy()
+        induced_graph: nx.DiGraph = nx.DiGraph(self).subgraph(filtered_nodes).copy()
     
         # Filter edges
         if edge_filter:
@@ -814,7 +814,7 @@ class RepoAnalyzer(DAGish):
             ]
             induced_graph.remove_edges_from(edges_to_remove)
     
-        return induced_graph
+        return DAGish(induced_graph)
     
     def write_function(self, function: str, code: str):
         """Change `code` attribute of the `function` node and write it to a file."""

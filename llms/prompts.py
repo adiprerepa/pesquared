@@ -1,50 +1,72 @@
+"""Prompt templates for LLM-based code analysis and optimization."""
+
 from langchain.prompts import PromptTemplate
 
-ALGORITHM_OUTLINE_PROMPT = PromptTemplate(
-    input_variables=["function_name", "code"],
+ALGORITHM_BOTTLENECK_PROMPT = PromptTemplate(
+    input_variables=["function_name", "code", "bottleneck"],
     template="""
-You are an algorithms analyzer. Analyze the algorithm for the following C++ function {function_name}.
+You are acting as a **senior performance engineer**.
+The *only* code fragment we will focus on for now is the following call inside
+`calcColor(unsigned char*, Autonoma*, Ray, unsigned int)`
+
+```cpp
+{bottleneck}
+```
+
+The full source for that function is supplied below (enclosed in triple back-ticks) so that you can see how the data produced by {bottleneck} flows into later stages.
 
 ```cpp
 {code}
 ```
 
-Write a detailed, step by step outline of the algorithm as a numbered list.
-"""
-)
+**Goal:** Identify *bottlenecks*—but **do not** propose fixes yet.
+We will optimize iteratively in later steps.
 
-ALGORITHM_BOTTLENECK_PROMPT = PromptTemplate(
-    input_variables=["function_name", "code", "steps"],
-    template="""
-You are a performance engineer. Analyze the following hot path in {function_name} for bottlenecks.
-
-{code}
-
-We will optimize this step by step.
-
-Structure your response as follows:
+**Deliverable format (strict):**
 
 # Bottleneck Insights
-<List out the function's top bottleneck step (don't worry about how to fix just yet)>
+
 ## Bottleneck `NAME`:
-<1 sentence description of step `NAME`>
+
+<one-sentence summary of what "NAME" is and why it may be costly>
+
 ### Dependants
-Fill in the following VERBATIM (filling in for the `variables` by their semantic meaning):
-The outputs from `NAME` are DIRECTLY utilized by the future steps (provide code snippet as well as semantic meaning): 
-- `A`
-- `B`
--  ...
+
+The outputs from **`NAME`** are *directly* consumed by the following later steps (include snippet + semantic role for each):
+
+* `A` - <what the variable/function is and why it needs the result>
+* `B`
+* …
+
 ### Analysis of the Utilization of `NAME`
-First, write the following: "In the abstract, performing `NAME` is useful because it provides ..."
-Then, analyze what information from `NAME` is ACTUALLY being used by `A`, `B`, ...:
-<your analysis here>
-If there exists a `BETTER_METHOD` to perform which yields the same information as `NAME` but is faster, then write:
-#### NOTE to SELF
-'Consider changing *`NAME`* to *`BETTER_METHOD`*'
-Else:
-#### Nothing here to optimize
-N/A
-```
+
+In the abstract, performing `NAME` is useful because it provides …
+Now enumerate **exactly what information** `A`, `B`, … actually read from `NAME`, reasoning step-by-step. Append *θ( … )* or *O( … )* for the cost of each access pattern.
+
+#### Analysis of the Alternatives to `NAME`
+
+For **each** concrete need of `A`, `B`, …, list alternative ways to obtain just that information (not the whole of `NAME`).
+
+1. *ALT₁* - short description (cost: O( … ))
+2. *ALT₂* - …
+
+#### Note to Self
+
+1. Consider changing `NAME` to `ALT₁`
+2. Consider changing `NAME` to `ALT₂`
+3. …
+
+**Mandatory style rules**
+
+1. Preserve the headings and bullet structure exactly.
+2. Replace `NAME`, `A`, `B`, etc. with the real identifiers & meanings you infer.
+3. No optimization suggestions—only analysis and alternatives listing.
+4. Use tight technical language (one idea per sentence; avoid fluff).
+5. Cite code lines or variable names verbatim; do **not** paraphrase them.
+6. When giving costs, favour tight-bound Big-O or Θ notation.
+7. Think **step-by-step** before writing; include *all* intermediate reasoning that affects complexity.
+
+**Begin your analysis below this line.**
 """
 )
 

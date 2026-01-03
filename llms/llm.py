@@ -1,7 +1,9 @@
+"""Universal LLM wrapper supporting multiple providers and chain operations."""
+
 import os
 from typing import Optional, List, Dict, Any
 from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain, SequentialChain
+from langchain_community.chains import LLMChain, SequentialChain
 
 # Import necessary LangChain components
 from langchain_core.language_models import BaseChatModel

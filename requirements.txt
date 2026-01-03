@@ -21,5 +21,6 @@ langchain-anthropic
 langchain-google-genai
 langgraph
 langchain_community
+langchain-community
 numexpr
 langsmith

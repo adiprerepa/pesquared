@@ -22,11 +22,11 @@ class DAGish(nx.DiGraph):
                 merged_attr = attr.copy()
                 merged_attr.update(node_attr)
                 if 'label' not in merged_attr:
-                    raise ValueError(f"Node {node} must have a label")
+                    merged_attr['label'] = node
             else:
                 # n is just a node identifier
                 if 'label' not in attr:
-                    raise ValueError(f"Node {n} must have a label")
+                    attr['label'] = n
         
         super().add_nodes_from(nodes_for_adding, **attr)
     
