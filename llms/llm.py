@@ -3,7 +3,7 @@
 import os
 from typing import Optional, List, Dict, Any
 from langchain.prompts import PromptTemplate
-from langchain_community.chains import LLMChain, SequentialChain
+from langchain.chains import LLMChain, SequentialChain
 
 # Import necessary LangChain components
 from langchain_core.language_models import BaseChatModel
@@ -11,6 +11,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
 
 # Provider-specific imports
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -99,29 +100,36 @@ class UniversalLLM:
             
             elif self.provider == "meta":
                 base_url = "https://api.llama.com/compat/v1/"
+                params = {
+                    "model": self.model,
+                    "temperature": temp,
+                }
+                if self.max_tokens is not None:
+                    params["max_tokens"] = self.max_tokens
+                # For OpenAI-compatible APIs, use 'api_key' and 'base_url' as per langchain_openai
                 return ChatOpenAI(
-                    model=self.model,
-                    temperature=temp,
-                    max_tokens=self.max_tokens,
-                    openai_api_key=self.api_key,
-                    openai_api_base=base_url,
+                    api_key=SecretStr(self.api_key) if self.api_key is not None else None,
+                    base_url=base_url,
+                    **params,
                     **self.kwargs
                 )
                 
             elif self.provider == "vllm":
                 # Assuming vLLM is running with an OpenAI-compatible API
                 base_url = os.getenv("VLLM_API_BASE", "http://localhost:8000/v1")
-                
                 params = {
                     "model": self.model,
                     "temperature": temp,
-                    "base_url": base_url,
-                    "api_key": self.api_key,  # vLLM may not require authentication
                 }
                 if self.max_tokens is not None:
                     params["max_tokens"] = self.max_tokens
-                
-                return ChatOpenAI(**params, **{k: v for k, v in self.kwargs.items() if k != "base_url"})
+                # For OpenAI-compatible APIs, use 'api_key' and 'base_url' as per langchain_openai
+                return ChatOpenAI(
+                    api_key=SecretStr(self.api_key) if self.api_key is not None else None,
+                    base_url=base_url,
+                    **params,
+                    **{k: v for k, v in self.kwargs.items() if k not in ["base_url"]}
+                )
                 
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
@@ -191,9 +199,15 @@ class UniversalLLM:
         try:
             # Generate response
             response = llm.invoke(messages)
-            
-            # Extract and return the content
-            return response.content
+            # Extract and return the content, handling list/str
+            content = response.content
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                # Join list elements if they are strings, else convert dicts to str
+                return "\n".join(str(x) for x in content)
+            else:
+                return str(content)
         except Exception as e:
             raise ValueError(f"Error generating response: {str(e)}")
     
@@ -228,9 +242,14 @@ class UniversalLLM:
         try:
             # Generate response asynchronously
             response = await llm.ainvoke(messages)
-            
-            # Extract and return the content
-            return response.content
+            # Extract and return the content, handling list/str
+            content = response.content
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                return "\n".join(str(x) for x in content)
+            else:
+                return str(content)
         except Exception as e:
             raise ValueError(f"Error generating async response: {str(e)}")
     
